@@ -3,5 +3,5 @@ uvicorn
 openai
 python-multipart
 pdfminer.six
-mammoth
+
 
