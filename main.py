@@ -10,13 +10,9 @@ def root():
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # Izveidojam pagaidu direktoriju Railway vidē
     temp_dir = tempfile.mkdtemp(prefix="upload_")
-
-    # Pilns fails ceļš
     file_path = os.path.join(temp_dir, file.filename)
 
-    # Saglabājam augšupielādēto failu
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
 
@@ -25,4 +21,3 @@ async def upload_file(file: UploadFile = File(...)):
         "filename": file.filename,
         "temp_path": file_path
     }
-
