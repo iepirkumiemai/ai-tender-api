@@ -11,9 +11,10 @@ import mammoth
 from pdfminer.high_level import extract_text
 from openai import OpenAI
 
+# Init OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI-Tender-API", version="2.1")
+app = FastAPI(title="AI-Tender-API", version="3.0")
 
 
 # ============================================================
@@ -35,7 +36,7 @@ def extract_edoc(path: str) -> Dict:
                     full_path = os.path.join(root, filename)
                     ext = filename.lower().split(".")[-1]
 
-                    # XML failu ekstrakcija
+                    # XML files
                     if ext == "xml":
                         try:
                             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -90,7 +91,6 @@ def extract_edoc(path: str) -> Dict:
                         })
                         continue
 
-                    # Citi faili – saglabājam info
                     results["raw_files"].append({
                         "filename": filename,
                         "path": full_path
@@ -100,7 +100,7 @@ def extract_edoc(path: str) -> Dict:
 
 
 # ============================================================
-# 2. AI ANALĪZE (Stabilā OpenAI metode)
+# 2. AI ANALYSIS (Stable OpenAI Chat API)
 # ============================================================
 async def run_ai_analysis(text: str):
     if not text or text.strip() == "":
@@ -118,7 +118,7 @@ TASK:
 3. Identify non-compliant or missing elements.
 4. Provide practical improvement recommendations.
 
-Respond strictly in JSON with keys:
+Respond STRICTLY in pure JSON:
 - summary
 - compliance_score
 - non_compliance_items
@@ -127,16 +127,20 @@ Respond strictly in JSON with keys:
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.choices[0].message["content"]
+    # Correct SDK syntax:
+    ai_raw = response.choices[0].message.content
+
+    # Remove code block wrappers if model adds them
+    clean = ai_raw.strip().replace("```json", "").replace("```", "").strip()
+
+    return clean
 
 
 # ============================================================
-# 3. PDF ekstrakcija
+# 3. File extractors
 # ============================================================
 def extract_pdf(path: str) -> str:
     try:
@@ -145,9 +149,6 @@ def extract_pdf(path: str) -> str:
         return ""
 
 
-# ============================================================
-# 4. DOCX ekstrakcija
-# ============================================================
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -157,7 +158,7 @@ def extract_docx(path: str) -> str:
 
 
 # ============================================================
-# 5. Universālā faila apstrāde
+# 4. Universal file processor
 # ============================================================
 def process_file(file_path: str, ext: str) -> Dict:
     ext = ext.lower()
@@ -182,7 +183,7 @@ def process_file(file_path: str, ext: str) -> Dict:
 
 
 # ============================================================
-# 6. HEALTH CHECK
+# 5. HEALTH CHECK
 # ============================================================
 @app.get("/api/status")
 async def status():
@@ -190,22 +191,21 @@ async def status():
 
 
 # ============================================================
-# 7. AUTO-ANALYZE UPLOAD: ekstrakcija + AI analīze
+# 6. AUTO-ANALYZE UPLOAD (file → extract → AI)
 # ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     filename = file.filename
     ext = filename.split(".")[-1].lower()
 
-    # Saglabā failu pagaidu vietā
+    # Save temp file
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    # Ekstrakcija
+    # Extract content
     extraction = process_file(tmp_path, ext)
 
-    # Izvēlamies tekstu analīzei
     if ext in ["pdf", "docx", "txt"]:
         text = extraction.get("text", "")
 
@@ -216,15 +216,17 @@ async def upload_file(file: UploadFile = File(...)):
     else:
         text = ""
 
-    # AI analīze
-    ai_json_text = await run_ai_analysis(text)
+    # Run AI
+    ai_json_raw = await run_ai_analysis(text)
 
     try:
-        ai_data = json.loads(ai_json_text)
+        ai_data = json.loads(ai_json_raw)
     except:
-        ai_data = {"error": "AI returned non-JSON", "raw": ai_json_text}
+        ai_data = {
+            "error": "AI returned non-JSON",
+            "raw_output": ai_json_raw
+        }
 
-    # Atbilde
     return JSONResponse({
         "status": "OK",
         "filename": filename,
