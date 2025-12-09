@@ -1,6 +1,7 @@
 import os
 import uuid
 import mimetypes
+import zipfile
 from fastapi import FastAPI, UploadFile, File
 
 # PDF ekstrakcija
@@ -9,7 +10,7 @@ from pdfminer.high_level import extract_text
 # DOCX ekstrakcija
 import mammoth
 
-app = FastAPI(title="AI Iepirkumi API", version="1.0")
+app = FastAPI(title="AI Iepirkumi API", version="1.1")
 
 
 # ======================================================
@@ -105,11 +106,55 @@ def extract_docx_text(file_path: str):
 
 
 # ======================================================
+# EDOC → ZIP → XML EKSTRAKCIJA
+# ======================================================
+def extract_edoc(file_path: str):
+    """
+    Atver EDOC (ZIP) konteineru, nolasa tā saturu un izdala dokumentus + XML.
+    """
+    try:
+        result = {
+            "files": [],
+            "documents": [],
+            "xml": []
+        }
+
+        with zipfile.ZipFile(file_path, 'r') as z:
+            for name in z.namelist():
+
+                # Saraksts ar visiem failiem EDOC iekšā
+                result["files"].append(name)
+
+                # Dokumenti (PDF, DOCX, TXT)
+                if name.lower().endswith((".pdf", ".docx", ".txt")):
+                    result["documents"].append(name)
+
+                # XML failu lasīšana
+                if name.lower().endswith(".xml"):
+                    try:
+                        xml_content = z.read(name).decode("utf-8", errors="ignore")
+                        result["xml"].append({
+                            "filename": name,
+                            "content": xml_content
+                        })
+                    except:
+                        result["xml"].append({
+                            "filename": name,
+                            "content": "[XML_READ_ERROR]"
+                        })
+
+        return result
+
+    except Exception as e:
+        return {"error": f"[EDOC_EXTRACT_ERROR] {str(e)}"}
+
+
+# ======================================================
 # UNIVERSĀLĀ FAILU APSTRĀDE (Variants B)
 # ======================================================
 def process_file(file_type: str, file_path: str):
     """
-    Universāls apstrādes modulis.
+    Universāls apstrādes modulis pēc faila tipa.
     """
     # PDF
     if file_type == "pdf":
@@ -129,32 +174,21 @@ def process_file(file_type: str, file_path: str):
         except:
             return {"extracted_text": None, "note": "TXT read error"}
 
-    # EDOC — nākamais solis (ZIP/XML)
+    # EDOC → ZIP → XML
     if file_type == "edoc":
-        return {
-            "extracted_text": None,
-            "note": "EDOC extraction module not yet implemented"
-        }
+        edoc_data = extract_edoc(file_path)
+        return {"edoc_content": edoc_data}
 
-    # ZIP — nākotnes modulis
+    # ZIP (nākotnē – atbalsts ZIP dokumentu paketēm)
     if file_type == "zip":
-        return {
-            "extracted_text": None,
-            "note": "ZIP extraction not yet implemented"
-        }
+        return {"note": "ZIP extraction not yet implemented"}
 
     # Attēli (nākotnē OCR)
     if file_type in ["jpg", "png"]:
-        return {
-            "extracted_text": None,
-            "note": "OCR module not yet implemented"
-        }
+        return {"note": "OCR module not yet implemented"}
 
     # Default
-    return {
-        "extracted_text": None,
-        "note": "Unsupported file type"
-    }
+    return {"note": "Unsupported file type"}
 
 
 # ======================================================
@@ -178,7 +212,7 @@ async def upload_file(file: UploadFile = File(...)):
     file_info = detect_file_type(file_path)
     file_type = file_info["file_type"]
 
-    # 5. Apstrādā failu
+    # 5. Apstrādā failu pēc tipa
     process_result = process_file(file_type, file_path)
 
     # 6. Atbilde
@@ -186,7 +220,7 @@ async def upload_file(file: UploadFile = File(...)):
         "status": "uploaded",
         "filename": file.filename,
         "temp_path": file_path,
-        "file_type": file_info["file_type"],
+        "file_type": file_type,
         "mime_type": file_info["mime_type"],
         "magic": file_info["magic"],
         "result": process_result
