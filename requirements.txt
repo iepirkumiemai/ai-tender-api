@@ -1,11 +1,4 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-python-multipart==0.0.9
-mammoth==1.6.0
-pdfminer.six==20221105
-chardet==5.2.0
-lxml==5.2.1
-openai==1.35.10
-
-
-
+fastapi
+uvicorn
+openai
+python-multipart
