@@ -11,7 +11,7 @@ from pdfminer.high_level import extract_text as pdf_extract
 import mammoth
 
 # TXT
-import chardet
+
 
 # XML
 from lxml import etree
