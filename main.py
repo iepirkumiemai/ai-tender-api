@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import zipfile
 from typing import Dict
@@ -8,13 +9,16 @@ from fastapi.responses import JSONResponse
 
 import mammoth
 from pdfminer.high_level import extract_text
+from openai import OpenAI
 
-app = FastAPI(title="AI-Tender-API", version="1.0")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+app = FastAPI(title="AI-Tender-API", version="2.0")
 
 
-# ================================
-# 1. Helper: EDOC extraction
-# ================================
+# ============================================================
+# 1. EDOC → ZIP → Extract PDF/DOCX/TXT + XML
+# ============================================================
 def extract_edoc(path: str) -> Dict:
     results = {
         "documents": [],
@@ -31,7 +35,7 @@ def extract_edoc(path: str) -> Dict:
                     full_path = os.path.join(root, filename)
                     ext = filename.lower().split(".")[-1]
 
-                    # XML files
+                    # XML failu ekstrakcija
                     if ext == "xml":
                         try:
                             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -45,7 +49,7 @@ def extract_edoc(path: str) -> Dict:
                         })
                         continue
 
-                    # TXT files
+                    # TXT
                     if ext == "txt":
                         try:
                             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -59,21 +63,21 @@ def extract_edoc(path: str) -> Dict:
                         })
                         continue
 
-                    # DOCX files
+                    # DOCX
                     if ext == "docx":
                         try:
                             with open(full_path, "rb") as f:
-                                doc = mammoth.convert_to_markdown(f).value
+                                extracted = mammoth.convert_to_markdown(f).value
                         except:
-                            doc = ""
+                            extracted = ""
 
                         results["documents"].append({
                             "filename": filename,
-                            "text": doc
+                            "text": extracted
                         })
                         continue
 
-                    # PDF files
+                    # PDF
                     if ext == "pdf":
                         try:
                             text = extract_text(full_path)
@@ -86,7 +90,7 @@ def extract_edoc(path: str) -> Dict:
                         })
                         continue
 
-                    # Unknown files
+                    # Citi faili – saglabājam info
                     results["raw_files"].append({
                         "filename": filename,
                         "path": full_path
@@ -95,9 +99,41 @@ def extract_edoc(path: str) -> Dict:
     return results
 
 
-# ================================
-# 2. Helper: PDF extraction
-# ================================
+# ============================================================
+# 2. AI ANALĪZE
+# ============================================================
+async def run_ai_analysis(text: str):
+    prompt = f"""
+You are an AI Tender Evaluation Expert.
+
+DOCUMENT CONTENT:
+{text}
+
+TASK:
+1. Provide a concise summary.
+2. Evaluate compliance level (0–100%).
+3. Identify non-compliant or missing elements.
+4. Provide practical improvement recommendations.
+
+Respond strictly in JSON:
+- summary
+- compliance_score
+- non_compliance_items (array)
+- recommendations
+"""
+
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt,
+        response_format={"type": "json_object"}
+    )
+
+    return response.output[0].content[0].text
+
+
+# ============================================================
+# 3. PDF ekstrakcija
+# ============================================================
 def extract_pdf(path: str) -> str:
     try:
         return extract_text(path)
@@ -105,9 +141,9 @@ def extract_pdf(path: str) -> str:
         return ""
 
 
-# ================================
-# 3. Helper: DOCX extraction
-# ================================
+# ============================================================
+# 4. DOCX ekstrakcija
+# ============================================================
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -116,66 +152,77 @@ def extract_docx(path: str) -> str:
         return ""
 
 
-# ================================
-# 4. File processor — universal
-# ================================
-def process_file(file_path: str, ext: str):
+# ============================================================
+# 5. Universālā faila apstrāde
+# ============================================================
+def process_file(file_path: str, ext: str) -> Dict:
     ext = ext.lower()
 
     if ext == "pdf":
-        return {
-            "file_type": "pdf",
-            "text": extract_pdf(file_path)
-        }
+        return {"type": "pdf", "text": extract_pdf(file_path)}
 
     if ext == "docx":
-        return {
-            "file_type": "docx",
-            "text": extract_docx(file_path)
-        }
+        return {"type": "docx", "text": extract_docx(file_path)}
+
+    if ext == "txt":
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return {"type": "txt", "text": f.read()}
+        except:
+            return {"type": "txt", "text": ""}
 
     if ext == "edoc":
-        edoc_data = extract_edoc(file_path)
-        return {
-            "file_type": "edoc",
-            "documents": edoc_data["documents"],
-            "xml": edoc_data["xml"],
-            "raw_files": edoc_data["raw_files"]
-        }
+        return extract_edoc(file_path)
 
-    # Unknown file
-    return {
-        "file_type": ext,
-        "error": "Unsupported file type"
-    }
+    return {"type": "unknown", "text": ""}
 
 
-# ================================
-# 5. API endpoint: status
-# ================================
+# ============================================================
+# 6. HEALTH CHECK
+# ============================================================
 @app.get("/api/status")
 async def status():
     return {"status": "OK", "service": "ai-tender-api"}
 
 
-# ================================
-# 6. API endpoint: file upload
-# ================================
+# ============================================================
+# 7. AUTO-ANALYZE UPLOAD: faila ekstrakcija + AI analīze
+# ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     filename = file.filename
     ext = filename.split(".")[-1].lower()
 
-    # Save temp file
+    # Saglabā failu pagaidu vietā
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    # Process file
-    result = process_file(tmp_path, ext)
+    # Ekstrakcija
+    extraction = process_file(tmp_path, ext)
 
+    # Izvēlamies tekstu analīzei
+    if ext in ["pdf", "docx", "txt"]:
+        text = extraction.get("text", "")
+
+    elif ext == "edoc":
+        all_docs = extraction.get("documents", [])
+        text = "\n\n".join([d.get("text", "") for d in all_docs])
+
+    else:
+        text = ""
+
+    # AI analīze
+    ai_json_text = await run_ai_analysis(text)
+    ai_data = json.loads(ai_json_text)
+
+    # Atbilde
     return JSONResponse({
+        "status": "OK",
         "filename": filename,
-        "extension": ext,
-        "result": result
+        "file_type": ext,
+        "extracted_text": text,
+        "ai_analysis": ai_data,
+        "edoc_xml": extraction.get("xml") if ext == "edoc" else None,
+        "edoc_raw_files": extraction.get("raw_files") if ext == "edoc" else None
     })
