@@ -6,6 +6,9 @@ from fastapi import FastAPI, UploadFile, File
 # PDF ekstrakcija
 from pdfminer.high_level import extract_text
 
+# DOCX ekstrakcija
+import mammoth
+
 app = FastAPI(title="AI Iepirkumi API", version="1.0")
 
 
@@ -37,7 +40,7 @@ def detect_file_type(file_path: str):
 
     ext = file_path.lower()
 
-    # PDF
+    # PDF (%PDF = 25504446)
     if ext.endswith(".pdf") or magic.startswith("25504446"):
         return {"file_type": "pdf", "mime_type": mime_type, "magic": magic}
 
@@ -57,11 +60,11 @@ def detect_file_type(file_path: str):
     if ext.endswith(".zip"):
         return {"file_type": "zip", "mime_type": mime_type, "magic": magic}
 
-    # JPG
+    # JPG (ffd8ff)
     if magic.startswith("ffd8ff"):
         return {"file_type": "jpg", "mime_type": mime_type, "magic": magic}
 
-    # PNG
+    # PNG (89504e47)
     if magic.startswith("89504e47"):
         return {"file_type": "png", "mime_type": mime_type, "magic": magic}
 
@@ -75,7 +78,6 @@ def detect_file_type(file_path: str):
 def extract_pdf_text(file_path: str):
     """
     Ekstrahē tekstu no PDF, izmantojot pdfminer.six.
-    Ja PDF nesatur tekstu — atgriež tukšu string.
     """
     try:
         text = extract_text(file_path)
@@ -87,29 +89,37 @@ def extract_pdf_text(file_path: str):
 
 
 # ======================================================
-# UNIVERSĀLAIS FAILU PROCESSORS (Variants B)
+# DOCX EKSTRAKCIJA
+# ======================================================
+def extract_docx_text(file_path: str):
+    """
+    Ekstrahē tekstu no DOCX faila, izmantojot Mammoth.
+    """
+    try:
+        with open(file_path, "rb") as docx_file:
+            result = mammoth.extract_raw_text(docx_file)
+            text = result.value or ""
+            return text.strip()
+    except Exception as e:
+        return f"[DOCX_EXTRACT_ERROR] {str(e)}"
+
+
+# ======================================================
+# UNIVERSĀLĀ FAILU APSTRĀDE (Variants B)
 # ======================================================
 def process_file(file_type: str, file_path: str):
     """
     Universāls apstrādes modulis.
-    Šobrīd implementēts PDF, nākamais būs DOCX un EDOC.
     """
     # PDF
     if file_type == "pdf":
         extracted_text = extract_pdf_text(file_path)
         return {"extracted_text": extracted_text}
 
-    # DOCX — būs nākamais solis
+    # DOCX
     if file_type == "docx":
-        return {"extracted_text": None, "note": "DOCX extraction module not yet implemented"}
-
-    # EDOC — būs nākamais solis pēc DOCX
-    if file_type == "edoc":
-        return {"extracted_text": None, "note": "EDOC extraction module not yet implemented"}
-
-    # ZIP — vēlāk atvērsim un analizēsim saturu
-    if file_type == "zip":
-        return {"extracted_text": None, "note": "ZIP extraction not yet implemented"}
+        extracted_text = extract_docx_text(file_path)
+        return {"extracted_text": extracted_text}
 
     # TXT
     if file_type == "txt":
@@ -119,12 +129,32 @@ def process_file(file_type: str, file_path: str):
         except:
             return {"extracted_text": None, "note": "TXT read error"}
 
-    # Attēli — nākotnē OCR
+    # EDOC — nākamais solis (ZIP/XML)
+    if file_type == "edoc":
+        return {
+            "extracted_text": None,
+            "note": "EDOC extraction module not yet implemented"
+        }
+
+    # ZIP — nākotnes modulis
+    if file_type == "zip":
+        return {
+            "extracted_text": None,
+            "note": "ZIP extraction not yet implemented"
+        }
+
+    # Attēli (nākotnē OCR)
     if file_type in ["jpg", "png"]:
-        return {"extracted_text": None, "note": "OCR module not yet implemented"}
+        return {
+            "extracted_text": None,
+            "note": "OCR module not yet implemented"
+        }
 
     # Default
-    return {"extracted_text": None, "note": "Unsupported file type"}
+    return {
+        "extracted_text": None,
+        "note": "Unsupported file type"
+    }
 
 
 # ======================================================
@@ -132,27 +162,26 @@ def process_file(file_type: str, file_path: str):
 # ======================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-
-    # 1. Izveido pagaidu direktoriju
+    # 1. Pagaidu direktorijs
     file_id = uuid.uuid4().hex
     upload_dir = f"/tmp/upload_{file_id}"
     os.makedirs(upload_dir, exist_ok=True)
 
-    # 2. Pilnais fails
+    # 2. Pilns ceļš
     file_path = os.path.join(upload_dir, file.filename)
 
     # 3. Saglabā failu
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
 
-    # 4. Atrod faila tipu
+    # 4. Detektē faila tipu
     file_info = detect_file_type(file_path)
     file_type = file_info["file_type"]
 
-    # 5. Izpilda universālo apstrādi
+    # 5. Apstrādā failu
     process_result = process_file(file_type, file_path)
 
-    # 6. Atbildē viss nepieciešamais
+    # 6. Atbilde
     return {
         "status": "uploaded",
         "filename": file.filename,
