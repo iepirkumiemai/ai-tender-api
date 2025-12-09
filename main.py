@@ -1,227 +1,181 @@
 import os
-import uuid
-import mimetypes
+import tempfile
 import zipfile
-from fastapi import FastAPI, UploadFile, File
+from typing import Dict
 
-# PDF ekstrakcija
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+
+import mammoth
 from pdfminer.high_level import extract_text
 
-# DOCX ekstrakcija
-import mammoth
-
-app = FastAPI(title="AI Iepirkumi API", version="1.1")
+app = FastAPI(title="AI-Tender-API", version="1.0")
 
 
-# ======================================================
-# ROOT ENDPOINT
-# ======================================================
-@app.get("/")
-def root():
-    return {"status": "OK", "service": "ai-iepirkumi-api"}
+# ================================
+# 1. Helper: EDOC extraction
+# ================================
+def extract_edoc(path: str) -> Dict:
+    results = {
+        "documents": [],
+        "xml": [],
+        "raw_files": []
+    }
+
+    with zipfile.ZipFile(path, 'r') as z:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            z.extractall(tmpdir)
+
+            for root, dirs, files in os.walk(tmpdir):
+                for filename in files:
+                    full_path = os.path.join(root, filename)
+                    ext = filename.lower().split(".")[-1]
+
+                    # XML files
+                    if ext == "xml":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                        except:
+                            content = ""
+
+                        results["xml"].append({
+                            "filename": filename,
+                            "content": content
+                        })
+                        continue
+
+                    # TXT files
+                    if ext == "txt":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        except:
+                            text = ""
+
+                        results["documents"].append({
+                            "filename": filename,
+                            "text": text
+                        })
+                        continue
+
+                    # DOCX files
+                    if ext == "docx":
+                        try:
+                            with open(full_path, "rb") as f:
+                                doc = mammoth.convert_to_markdown(f).value
+                        except:
+                            doc = ""
+
+                        results["documents"].append({
+                            "filename": filename,
+                            "text": doc
+                        })
+                        continue
+
+                    # PDF files
+                    if ext == "pdf":
+                        try:
+                            text = extract_text(full_path)
+                        except:
+                            text = ""
+
+                        results["documents"].append({
+                            "filename": filename,
+                            "text": text
+                        })
+                        continue
+
+                    # Unknown files
+                    results["raw_files"].append({
+                        "filename": filename,
+                        "path": full_path
+                    })
+
+    return results
 
 
-# ======================================================
-# FAILA TIPA DETEKTORS
-# ======================================================
-def detect_file_type(file_path: str):
-    """
-    Nosaka faila tipu pēc paplašinājuma, MIME type un magic bytes.
-    """
-    mime_type, _ = mimetypes.guess_type(file_path)
-    mime_type = mime_type or "application/octet-stream"
-
-    # Magic bytes
-    magic = ""
+# ================================
+# 2. Helper: PDF extraction
+# ================================
+def extract_pdf(path: str) -> str:
     try:
-        with open(file_path, "rb") as f:
-            magic = f.read(8).hex()
+        return extract_text(path)
     except:
-        magic = ""
-
-    ext = file_path.lower()
-
-    # PDF (%PDF = 25504446)
-    if ext.endswith(".pdf") or magic.startswith("25504446"):
-        return {"file_type": "pdf", "mime_type": mime_type, "magic": magic}
-
-    # DOCX
-    if ext.endswith(".docx"):
-        return {"file_type": "docx", "mime_type": mime_type, "magic": magic}
-
-    # TXT
-    if ext.endswith(".txt"):
-        return {"file_type": "txt", "mime_type": mime_type, "magic": magic}
-
-    # EDOC (eParaksta ZIP konteiners)
-    if ext.endswith(".edoc"):
-        return {"file_type": "edoc", "mime_type": mime_type, "magic": magic}
-
-    # ZIP
-    if ext.endswith(".zip"):
-        return {"file_type": "zip", "mime_type": mime_type, "magic": magic}
-
-    # JPG (ffd8ff)
-    if magic.startswith("ffd8ff"):
-        return {"file_type": "jpg", "mime_type": mime_type, "magic": magic}
-
-    # PNG (89504e47)
-    if magic.startswith("89504e47"):
-        return {"file_type": "png", "mime_type": mime_type, "magic": magic}
-
-    # Unknown
-    return {"file_type": "unknown", "mime_type": mime_type, "magic": magic}
-
-
-# ======================================================
-# PDF EKSTRAKCIJA
-# ======================================================
-def extract_pdf_text(file_path: str):
-    """
-    Ekstrahē tekstu no PDF, izmantojot pdfminer.six.
-    """
-    try:
-        text = extract_text(file_path)
-        if text and text.strip():
-            return text.strip()
         return ""
-    except Exception as e:
-        return f"[PDF_EXTRACT_ERROR] {str(e)}"
 
 
-# ======================================================
-# DOCX EKSTRAKCIJA
-# ======================================================
-def extract_docx_text(file_path: str):
-    """
-    Ekstrahē tekstu no DOCX faila, izmantojot Mammoth.
-    """
+# ================================
+# 3. Helper: DOCX extraction
+# ================================
+def extract_docx(path: str) -> str:
     try:
-        with open(file_path, "rb") as docx_file:
-            result = mammoth.extract_raw_text(docx_file)
-            text = result.value or ""
-            return text.strip()
-    except Exception as e:
-        return f"[DOCX_EXTRACT_ERROR] {str(e)}"
+        with open(path, "rb") as f:
+            return mammoth.convert_to_markdown(f).value
+    except:
+        return ""
 
 
-# ======================================================
-# EDOC → ZIP → XML EKSTRAKCIJA
-# ======================================================
-def extract_edoc(file_path: str):
-    """
-    Atver EDOC (ZIP) konteineru, nolasa tā saturu un izdala dokumentus + XML.
-    """
-    try:
-        result = {
-            "files": [],
-            "documents": [],
-            "xml": []
+# ================================
+# 4. File processor — universal
+# ================================
+def process_file(file_path: str, ext: str):
+    ext = ext.lower()
+
+    if ext == "pdf":
+        return {
+            "file_type": "pdf",
+            "text": extract_pdf(file_path)
         }
 
-        with zipfile.ZipFile(file_path, 'r') as z:
-            for name in z.namelist():
+    if ext == "docx":
+        return {
+            "file_type": "docx",
+            "text": extract_docx(file_path)
+        }
 
-                # Saraksts ar visiem failiem EDOC iekšā
-                result["files"].append(name)
-
-                # Dokumenti (PDF, DOCX, TXT)
-                if name.lower().endswith((".pdf", ".docx", ".txt")):
-                    result["documents"].append(name)
-
-                # XML failu lasīšana
-                if name.lower().endswith(".xml"):
-                    try:
-                        xml_content = z.read(name).decode("utf-8", errors="ignore")
-                        result["xml"].append({
-                            "filename": name,
-                            "content": xml_content
-                        })
-                    except:
-                        result["xml"].append({
-                            "filename": name,
-                            "content": "[XML_READ_ERROR]"
-                        })
-
-        return result
-
-    except Exception as e:
-        return {"error": f"[EDOC_EXTRACT_ERROR] {str(e)}"}
-
-
-# ======================================================
-# UNIVERSĀLĀ FAILU APSTRĀDE (Variants B)
-# ======================================================
-def process_file(file_type: str, file_path: str):
-    """
-    Universāls apstrādes modulis pēc faila tipa.
-    """
-    # PDF
-    if file_type == "pdf":
-        extracted_text = extract_pdf_text(file_path)
-        return {"extracted_text": extracted_text}
-
-    # DOCX
-    if file_type == "docx":
-        extracted_text = extract_docx_text(file_path)
-        return {"extracted_text": extracted_text}
-
-    # TXT
-    if file_type == "txt":
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return {"extracted_text": f.read()}
-        except:
-            return {"extracted_text": None, "note": "TXT read error"}
-
-    # EDOC → ZIP → XML
-    if file_type == "edoc":
+    if ext == "edoc":
         edoc_data = extract_edoc(file_path)
-        return {"edoc_content": edoc_data}
+        return {
+            "file_type": "edoc",
+            "documents": edoc_data["documents"],
+            "xml": edoc_data["xml"],
+            "raw_files": edoc_data["raw_files"]
+        }
 
-    # ZIP (nākotnē – atbalsts ZIP dokumentu paketēm)
-    if file_type == "zip":
-        return {"note": "ZIP extraction not yet implemented"}
-
-    # Attēli (nākotnē OCR)
-    if file_type in ["jpg", "png"]:
-        return {"note": "OCR module not yet implemented"}
-
-    # Default
-    return {"note": "Unsupported file type"}
+    # Unknown file
+    return {
+        "file_type": ext,
+        "error": "Unsupported file type"
+    }
 
 
-# ======================================================
-# UPLOAD ENDPOINT (universālais variants B)
-# ======================================================
+# ================================
+# 5. API endpoint: status
+# ================================
+@app.get("/api/status")
+async def status():
+    return {"status": "OK", "service": "ai-tender-api"}
+
+
+# ================================
+# 6. API endpoint: file upload
+# ================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    # 1. Pagaidu direktorijs
-    file_id = uuid.uuid4().hex
-    upload_dir = f"/tmp/upload_{file_id}"
-    os.makedirs(upload_dir, exist_ok=True)
+    filename = file.filename
+    ext = filename.split(".")[-1].lower()
 
-    # 2. Pilns ceļš
-    file_path = os.path.join(upload_dir, file.filename)
+    # Save temp file
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
 
-    # 3. Saglabā failu
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+    # Process file
+    result = process_file(tmp_path, ext)
 
-    # 4. Detektē faila tipu
-    file_info = detect_file_type(file_path)
-    file_type = file_info["file_type"]
-
-    # 5. Apstrādā failu pēc tipa
-    process_result = process_file(file_type, file_path)
-
-    # 6. Atbilde
-    return {
-        "status": "uploaded",
-        "filename": file.filename,
-        "temp_path": file_path,
-        "file_type": file_type,
-        "mime_type": file_info["mime_type"],
-        "magic": file_info["magic"],
-        "result": process_result
-    }
+    return JSONResponse({
+        "filename": filename,
+        "extension": ext,
+        "result": result
+    })
