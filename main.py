@@ -13,7 +13,7 @@ from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI-Tender-API", version="2.0")
+app = FastAPI(title="AI-Tender-API", version="2.1")
 
 
 # ============================================================
@@ -100,9 +100,12 @@ def extract_edoc(path: str) -> Dict:
 
 
 # ============================================================
-# 2. AI ANALĪZE
+# 2. AI ANALĪZE (Stabilā OpenAI metode)
 # ============================================================
 async def run_ai_analysis(text: str):
+    if not text or text.strip() == "":
+        text = "(no readable content)"
+
     prompt = f"""
 You are an AI Tender Evaluation Expert.
 
@@ -115,20 +118,21 @@ TASK:
 3. Identify non-compliant or missing elements.
 4. Provide practical improvement recommendations.
 
-Respond strictly in JSON:
+Respond strictly in JSON with keys:
 - summary
 - compliance_score
-- non_compliance_items (array)
+- non_compliance_items
 - recommendations
 """
 
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model="gpt-4o-mini",
-        input=prompt,
-        response_format={"type": "json_object"}
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
     )
 
-    return response.output[0].content[0].text
+    return response.choices[0].message["content"]
 
 
 # ============================================================
@@ -186,7 +190,7 @@ async def status():
 
 
 # ============================================================
-# 7. AUTO-ANALYZE UPLOAD: faila ekstrakcija + AI analīze
+# 7. AUTO-ANALYZE UPLOAD: ekstrakcija + AI analīze
 # ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -214,7 +218,11 @@ async def upload_file(file: UploadFile = File(...)):
 
     # AI analīze
     ai_json_text = await run_ai_analysis(text)
-    ai_data = json.loads(ai_json_text)
+
+    try:
+        ai_data = json.loads(ai_json_text)
+    except:
+        ai_data = {"error": "AI returned non-JSON", "raw": ai_json_text}
 
     # Atbilde
     return JSONResponse({
