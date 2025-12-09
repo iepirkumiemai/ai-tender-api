@@ -1,107 +1,58 @@
-import os
-import tempfile
-import zipfile
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
-
-app = FastAPI(
-    title="ai-tender-api",
-    version="0.3.0",
-    description="AI Tender dokumentu apstrādes un failu detektora modulis"
-)
-
-@app.get("/")
-async def root():
-    return {"status": "OK", "service": "ai-tender-api"}
-
-
-@app.get("/health")
-async def health():
-    return JSONResponse({"health": "UP"})
-
-
 # ===========================
-# FAILU TIPU DETEKTORS
+# PDF, DOCX, TXT, XML TEKSTA EKSTRAKCIJA
 # ===========================
-def detect_file_type(file_path: str, filename: str):
-    ext = filename.lower().split('.')[-1]
 
-    # 1. Primārā klasifikācija pēc paplašinājuma
-    if ext == "pdf":
-        return "pdf"
+from pdfminer.high_level import extract_text as pdf_extract
+from docx import Document
+from lxml import etree
 
-    if ext == "docx":
-        return "docx"
-
-    if ext == "doc":
-        return "doc"
-
-    if ext == "txt":
-        return "txt"
-
-    if ext == "csv":
-        return "csv"
-
-    if ext == "zip":
-        return "zip"
-
-    if ext == "edoc":
-        return "edoc"
-
-    # 2. Sekundārā klasifikācija pēc faila iekšējās struktūras
-    # ZIP/EDOC pārbaude
+def extract_text_from_pdf(path: str) -> str:
     try:
-        if zipfile.is_zipfile(file_path):
-            # EDOC parasti satur specificētus XML failus
-            with zipfile.ZipFile(file_path, 'r') as z:
-                names = z.namelist()
-                if any("XML" in n.upper() for n in names):
-                    return "edoc"
-            return "zip"
-    except:
-        pass
+        return pdf_extract(path)
+    except Exception as e:
+        return f"[PDF ERROR] {e}"
 
-    # 3. PDF signatūra (%PDF)
+def extract_text_from_docx(path: str) -> str:
     try:
-        with open(file_path, "rb") as f:
-            header = f.read(5)
-            if header == b"%PDF-":
-                return "pdf"
-    except:
-        pass
+        doc = Document(path)
+        paragraphs = [p.text for p in doc.paragraphs]
+        return "\n".join(paragraphs)
+    except Exception as e:
+        return f"[DOCX ERROR] {e}"
 
-    # 4. DOC signatūra (OLE2, sākas ar D0 CF 11 E0)
+def extract_text_from_txt(path: str) -> str:
     try:
-        with open(file_path, "rb") as f:
-            header = f.read(8)
-            if header.startswith(b"\xD0\xCF\x11\xE0"):
-                return "doc"
-    except:
-        pass
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        return f"[TXT ERROR] {e}"
 
-    return "unknown"
+def extract_xml_structure(path: str) -> str:
+    """
+    EDOC XML struktūras nolasīšana saprotamā teksta formā.
+    """
+    try:
+        tree = etree.parse(path)
+        root = tree.getroot()
+        return etree.tostring(root, pretty_print=True, encoding="unicode")
+    except Exception as e:
+        return f"[XML ERROR] {e}"
 
 
-# ===========================
-# FAILU AUGŠUPIELĀDE + TIPU NOTEIKŠANA
-# ===========================
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    temp_dir = tempfile.mkdtemp(prefix="uploaded_")
-    file_path = os.path.join(temp_dir, file.filename)
+def extract_text_by_type(path: str, file_type: str) -> str:
+    """
+    Vienotais interfeiss dokumentu teksta nolasīšanai.
+    """
+    if file_type == "pdf":
+        return extract_text_from_pdf(path)
 
-    # Saglabājam failu
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    if file_type == "docx":
+        return extract_text_from_docx(path)
 
-    file_type = detect_file_type(file_path, file.filename)
+    if file_type == "txt":
+        return extract_text_from_txt(path)
 
-    return {
-        "status": "OK",
-        "filename": file.filename,
-        "type": file_type,
-        "size_bytes": len(content),
-        "temp_dir": temp_dir,
-        "saved_to": file_path
-    }
+    if file_type == "edoc" and path.lower().endswith(".xml"):
+        return extract_xml_structure(path)
+
+    return "[UNSUPPORTED FILE TYPE]"
