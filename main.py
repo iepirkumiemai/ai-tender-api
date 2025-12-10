@@ -11,14 +11,14 @@ import mammoth
 from pdfminer.high_level import extract_text
 from openai import OpenAI
 
-# Init OpenAI client
+# OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI-Tender-API", version="3.0")
+app = FastAPI(title="AI-Tender-API", version="4.0")
 
 
 # ============================================================
-# 1. EDOC → ZIP → Extract PDF/DOCX/TXT + XML
+# 1. EDOC extraction (ZIP + documents + XML)
 # ============================================================
 def extract_edoc(path: str) -> Dict:
     results = {
@@ -36,18 +36,14 @@ def extract_edoc(path: str) -> Dict:
                     full_path = os.path.join(root, filename)
                     ext = filename.lower().split(".")[-1]
 
-                    # XML files
+                    # XML
                     if ext == "xml":
                         try:
                             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                                 content = f.read()
                         except:
                             content = ""
-
-                        results["xml"].append({
-                            "filename": filename,
-                            "content": content
-                        })
+                        results["xml"].append({"filename": filename, "content": content})
                         continue
 
                     # TXT
@@ -57,11 +53,7 @@ def extract_edoc(path: str) -> Dict:
                                 text = f.read()
                         except:
                             text = ""
-
-                        results["documents"].append({
-                            "filename": filename,
-                            "text": text
-                        })
+                        results["documents"].append({"filename": filename, "text": text})
                         continue
 
                     # DOCX
@@ -71,11 +63,7 @@ def extract_edoc(path: str) -> Dict:
                                 extracted = mammoth.convert_to_markdown(f).value
                         except:
                             extracted = ""
-
-                        results["documents"].append({
-                            "filename": filename,
-                            "text": extracted
-                        })
+                        results["documents"].append({"filename": filename, "text": extracted})
                         continue
 
                     # PDF
@@ -84,13 +72,10 @@ def extract_edoc(path: str) -> Dict:
                             text = extract_text(full_path)
                         except:
                             text = ""
-
-                        results["documents"].append({
-                            "filename": filename,
-                            "text": text
-                        })
+                        results["documents"].append({"filename": filename, "text": text})
                         continue
 
+                    # Everything else
                     results["raw_files"].append({
                         "filename": filename,
                         "path": full_path
@@ -100,7 +85,63 @@ def extract_edoc(path: str) -> Dict:
 
 
 # ============================================================
-# 2. AI ANALYSIS (Stable OpenAI Chat API)
+# 2. ZIP extraction (PDF / DOCX / TXT)
+# ============================================================
+def extract_zip(path: str) -> Dict:
+    results = {
+        "documents": [],
+        "raw_files": []
+    }
+
+    with zipfile.ZipFile(path, 'r') as z:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            z.extractall(tmpdir)
+
+            for root, dirs, files in os.walk(tmpdir):
+                for filename in files:
+                    full_path = os.path.join(root, filename)
+                    ext = filename.lower().split(".")[-1]
+
+                    # TXT
+                    if ext == "txt":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    # DOCX
+                    if ext == "docx":
+                        try:
+                            with open(full_path, "rb") as f:
+                                extracted = mammoth.convert_to_markdown(f).value
+                        except:
+                            extracted = ""
+                        results["documents"].append({"filename": filename, "text": extracted})
+                        continue
+
+                    # PDF
+                    if ext == "pdf":
+                        try:
+                            text = extract_text(full_path)
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    # Unknown
+                    results["raw_files"].append({
+                        "filename": filename,
+                        "path": full_path
+                    })
+
+    return results
+
+
+# ============================================================
+# 3. AI ANALYSIS (Stable OpenAI ChatCompletion format)
 # ============================================================
 async def run_ai_analysis(text: str):
     if not text or text.strip() == "":
@@ -118,7 +159,7 @@ TASK:
 3. Identify non-compliant or missing elements.
 4. Provide practical improvement recommendations.
 
-Respond STRICTLY in pure JSON:
+Return STRICT JSON:
 - summary
 - compliance_score
 - non_compliance_items
@@ -130,17 +171,15 @@ Respond STRICTLY in pure JSON:
         messages=[{"role": "user", "content": prompt}]
     )
 
-    # Correct SDK syntax:
     ai_raw = response.choices[0].message.content
 
-    # Remove code block wrappers if model adds them
     clean = ai_raw.strip().replace("```json", "").replace("```", "").strip()
 
     return clean
 
 
 # ============================================================
-# 3. File extractors
+# 4. PDF extraction
 # ============================================================
 def extract_pdf(path: str) -> str:
     try:
@@ -149,6 +188,9 @@ def extract_pdf(path: str) -> str:
         return ""
 
 
+# ============================================================
+# 5. DOCX extraction
+# ============================================================
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -158,7 +200,7 @@ def extract_docx(path: str) -> str:
 
 
 # ============================================================
-# 4. Universal file processor
+# 6. Universal file processor
 # ============================================================
 def process_file(file_path: str, ext: str) -> Dict:
     ext = ext.lower()
@@ -179,11 +221,14 @@ def process_file(file_path: str, ext: str) -> Dict:
     if ext == "edoc":
         return extract_edoc(file_path)
 
+    if ext == "zip":
+        return extract_zip(file_path)
+
     return {"type": "unknown", "text": ""}
 
 
 # ============================================================
-# 5. HEALTH CHECK
+# 7. Health check
 # ============================================================
 @app.get("/api/status")
 async def status():
@@ -191,7 +236,7 @@ async def status():
 
 
 # ============================================================
-# 6. AUTO-ANALYZE UPLOAD (file → extract → AI)
+# 8. AUTO-ANALYZE UPLOAD (file → extract → AI)
 # ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -203,29 +248,27 @@ async def upload_file(file: UploadFile = File(...)):
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    # Extract content
+    # Extraction
     extraction = process_file(tmp_path, ext)
 
+    # Determine text for AI
     if ext in ["pdf", "docx", "txt"]:
         text = extraction.get("text", "")
 
-    elif ext == "edoc":
+    elif ext in ["edoc", "zip"]:
         all_docs = extraction.get("documents", [])
         text = "\n\n".join([d.get("text", "") for d in all_docs])
 
     else:
         text = ""
 
-    # Run AI
-    ai_json_raw = await run_ai_analysis(text)
+    # AI analysis
+    ai_raw_json = await run_ai_analysis(text)
 
     try:
-        ai_data = json.loads(ai_json_raw)
+        ai_data = json.loads(ai_raw_json)
     except:
-        ai_data = {
-            "error": "AI returned non-JSON",
-            "raw_output": ai_json_raw
-        }
+        ai_data = {"error": "AI returned non-JSON", "raw_output": ai_raw_json}
 
     return JSONResponse({
         "status": "OK",
@@ -233,6 +276,7 @@ async def upload_file(file: UploadFile = File(...)):
         "file_type": ext,
         "extracted_text": text,
         "ai_analysis": ai_data,
-        "edoc_xml": extraction.get("xml") if ext == "edoc" else None,
-        "edoc_raw_files": extraction.get("raw_files") if ext == "edoc" else None
+        "documents": extraction.get("documents"),
+        "xml": extraction.get("xml") if ext == "edoc" else None,
+        "raw_files": extraction.get("raw_files")
     })
