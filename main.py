@@ -1,46 +1,50 @@
 # ===============================================
-# main.py — Tender Comparison API v11.1 (FINAL)
+# main.py — Tender Comparison API v12 (PDF-ready)
 # ===============================================
 
 import os
-import io
 import zipfile
 import tempfile
-from datetime import datetime
+from typing import List
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
-from typing import List
+
 import mammoth
 from pdfminer.high_level import extract_text
+from fpdf import FPDF
 from openai import OpenAI
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
 
-# -----------------------------------------------
+
+# ======================================================
 # OPENAI CLIENT
-# -----------------------------------------------
+# ======================================================
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# -----------------------------------------------
+
+# ======================================================
 # FASTAPI INIT
-# -----------------------------------------------
+# ======================================================
+
 app = FastAPI(
     title="AI Tender Comparison Engine",
-    version="11.1",
-    description="Uploads requirement files + candidate ZIP archives, compares them with AI and generates a downloadable PDF report."
+    version="12.0",
+    description="Uploads requirement documents + candidate ZIP files, compares them using GPT-4.1 and returns a PDF report."
 )
 
-# -----------------------------------------------
-# CLEAN UTIL
-# -----------------------------------------------
+
+# ======================================================
+# CLEAN TEXT UTILITY
+# ======================================================
+
 def clean(text: str) -> str:
     return text.replace("\x00", "").strip()
 
 
-# =================================================
-# FILE EXTRACTORS
-# =================================================
+# ======================================================
+#   FILE EXTRACTORS
+# ======================================================
 
 def extract_pdf(path: str) -> str:
     try:
@@ -83,15 +87,16 @@ def extract_zip(path: str) -> str:
                 tmp.write(z.read(name))
                 tmp_path = tmp.name
 
-            lname = name.lower()
-
-            if lname.endswith(".pdf"):
+            if name.lower().endswith(".pdf"):
                 combined += extract_pdf(tmp_path)
-            elif lname.endswith(".docx"):
+
+            elif name.lower().endswith(".docx"):
                 combined += extract_docx(tmp_path)
-            elif lname.endswith(".edoc"):
+
+            elif name.lower().endswith(".edoc"):
                 combined += extract_edoc(tmp_path)
-            elif lname.endswith(".zip"):
+
+            elif name.lower().endswith(".zip"):
                 combined += extract_zip(tmp_path)
 
             os.unlink(tmp_path)
@@ -99,24 +104,27 @@ def extract_zip(path: str) -> str:
     return combined
 
 
-# =================================================
-# AI — REQUIREMENT PARSER
-# =================================================
+# ======================================================
+#   AI — REQUIREMENT PARSER (GPT-4.1)
+# ======================================================
 
-def parse_requirements_ai(text: str) -> str:
+def parse_requirements_ai(text: str) -> dict:
+
     prompt = f"""
-Extract and structure these requirement documents.
+Izvelc prasības no dokumentiem un strukturē tās JSON formātā.
 
-Return JSON:
+Atgriez JSON:
+
 {{
-  "requirements": [...],
-  "summary": "...",
-  "key_points": [...],
-  "risk_flags": [...]
+  "prasības": [...],
+  "kopsavilkums": "...",
+  "galvenie_punkti": [...],
+  "riski": [...]
 }}
-Document text:
+
+Teksts:
 {text}
-"""
+    """
 
     response = client.responses.create(
         model="gpt-4.1",
@@ -126,30 +134,31 @@ Document text:
     return response.output_text
 
 
-# =================================================
-# AI — CANDIDATE COMPARISON
-# =================================================
+# ======================================================
+#   AI — CANDIDATE COMPARISON (GPT-4.1)
+# ======================================================
 
-def compare_candidate_ai(requirements: str, candidate_text: str) -> str:
+def compare_candidate_ai(requirements_structured: str, candidate_text: str) -> dict:
+
     prompt = f"""
-Compare this candidate document against the requirements.
+Salīdzini kandidāta dokumentus ar prasībām.
 
-Return JSON:
+Atgriez JSON formātā:
+
 {{
-  "match_score": 0-100,
-  "status": "GREEN | YELLOW | RED",
-  "matched_requirements": [...],
-  "missing_requirements": [...],
-  "risks": [...],
-  "summary": "..."
+  "status": "zaļš | dzeltens | sarkans",
+  "atbilst": [...],
+  "neatbilst": [...],
+  "jāpārbauda_manuāli": [...],
+  "kopsavilkums": "..."
 }}
 
-REQUIREMENTS:
-{requirements}
+PRASĪBAS:
+{requirements_structured}
 
-CANDIDATE DOCUMENT:
+KANDIDĀTS:
 {candidate_text}
-"""
+    """
 
     response = client.responses.create(
         model="gpt-4.1",
@@ -159,89 +168,54 @@ CANDIDATE DOCUMENT:
     return response.output_text
 
 
-# =================================================
-# PDF GENERATOR (MAKET: Nr.1)
-# =================================================
+# ======================================================
+# PDF GENERATOR (Helvetica, Railway-safe)
+# ======================================================
 
-def generate_pdf(requirements_text, requirements_struct, candidate_file, candidate_text, ai_eval_json):
+def generate_pdf_report(result_json: dict) -> str:
 
-    os.makedirs("/tmp/pdf_reports/", exist_ok=True)
+    base_dir = "/tmp/reports"
+    os.makedirs(base_dir, exist_ok=True)
 
-    filename = f"vertējums_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    full_path = f"/tmp/pdf_reports/{filename}"
+    pdf_path = f"{base_dir}/vertējums.pdf"
 
-    c = canvas.Canvas(full_path, pagesize=A4)
-    width, height = A4
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=12)
 
-    # -------------------
-    # TITLE PAGE
-    # -------------------
-    c.setFont("Helvetica-Bold", 24)
-    c.drawString(40, height - 80, "Iepirkuma tehniskais vērtējums")
+    pdf.set_font("Helvetica", size=16)
+    pdf.cell(0, 10, "Vērtējums", ln=True)
 
-    c.setFont("Helvetica", 12)
-    c.drawString(40, height - 120, f"Datums: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    c.drawString(40, height - 140, f"Versija: 11.1")
-    c.drawString(40, height - 160, f"Kandidāta fails: {candidate_file}")
+    pdf.set_font("Helvetica", size=11)
 
-    c.showPage()
+    # vienkārši izdrukā visu JSON kā tekstu
+    for key, value in result_json.items():
+        pdf.set_font("Helvetica", size=12)
+        pdf.multi_cell(0, 8, f"{key}:")
 
-    # -------------------
-    # REQUIREMENTS SECTION
-    # -------------------
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 50, "1. Iepirkuma prasības")
+        pdf.set_font("Helvetica", size=11)
+        pdf.multi_cell(0, 6, str(value))
+        pdf.ln(2)
 
-    c.setFont("Helvetica", 10)
-    text_object = c.beginText(40, height - 80)
-    text_object.textLines(requirements_text[:5000])  # preview
-    c.drawText(text_object)
+    pdf.output(pdf_path)
 
-    c.showPage()
-
-    # -------------------
-    # CANDIDATE TEXT
-    # -------------------
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 50, "2. Kandidāta dokumenti")
-
-    c.setFont("Helvetica", 10)
-    text_object = c.beginText(40, height - 80)
-    text_object.textLines(candidate_text[:5000])
-    c.drawText(text_object)
-
-    c.showPage()
-
-    # -------------------
-    # AI EVALUATION
-    # -------------------
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 50, "3. AI tehniskais salīdzinājums")
-
-    c.setFont("Helvetica", 10)
-    text_object = c.beginText(40, height - 80)
-    text_object.textLines(ai_eval_json)
-    c.drawText(text_object)
-
-    c.showPage()
-
-    c.save()
-    return full_path, filename
+    return pdf_path
 
 
-# =================================================
-# MAIN ENDPOINT — /compare_files
-# =================================================
+# ======================================================
+#   MAIN ENDPOINT — /compare_files_with_pdf
+# ======================================================
 
-@app.post("/compare_files")
-async def compare_files(
+@app.post("/compare_files_with_pdf")
+async def compare_files_with_pdf(
     requirements: List[UploadFile] = File(...),
     candidates: List[UploadFile] = File(...)
 ):
 
-    # -------------------------
+    # -------------------------------------
     # 1) EXTRACT REQUIREMENTS
-    # -------------------------
+    # -------------------------------------
+
     req_text = ""
 
     for f in requirements:
@@ -249,31 +223,32 @@ async def compare_files(
             tmp.write(await f.read())
             p = tmp.name
 
-        name = f.filename.lower()
+        filename = f.filename.lower()
 
-        if name.endswith(".pdf"):
+        if filename.endswith(".pdf"):
             req_text += extract_pdf(p)
-        elif name.endswith(".docx"):
+        elif filename.endswith(".docx"):
             req_text += extract_docx(p)
-        elif name.endswith(".edoc"):
+        elif filename.endswith(".edoc"):
             req_text += extract_edoc(p)
-        elif name.endswith(".zip"):
+        elif filename.endswith(".zip"):
             req_text += extract_zip(p)
         else:
-            raise HTTPException(400, f"Unsupported requirement file: {name}")
+            raise HTTPException(400, f"Nepareizs prasību faila tips: {filename}")
 
         os.unlink(p)
 
     if not req_text.strip():
-        raise HTTPException(400, "No readable requirement text.")
+        raise HTTPException(400, "Prasību failos nav nolasāma teksta.")
 
-    req_struct = parse_requirements_ai(req_text)
+    requirements_structured = parse_requirements_ai(req_text)
 
-    # -------------------------
+
+    # -------------------------------------
     # 2) PROCESS CANDIDATES
-    # -------------------------
+    # -------------------------------------
 
-    reports = []
+    candidate_results = []
 
     for f in candidates:
 
@@ -281,57 +256,47 @@ async def compare_files(
             tmp.write(await f.read())
             p = tmp.name
 
-        name = f.filename.lower()
+        filename = f.filename.lower()
 
-        if not name.endswith(".zip"):
-            raise HTTPException(400, "Candidate must be ZIP.")
+        if not filename.endswith(".zip"):
+            raise HTTPException(400, f"Kandidāta fails nav ZIP: {filename}")
 
-        cand_text = extract_zip(p)
+        candidate_text = extract_zip(p)
         os.unlink(p)
 
-        if not cand_text.strip():
-            reports.append({"candidate": name, "error": "empty candidate"})
+        if not candidate_text.strip():
+            candidate_results.append({
+                "kandidāts": f.filename,
+                "status": "sarkans",
+                "kļūda": "Tukšs vai nenolasāms ZIP."
+            })
             continue
 
-        ai_eval = compare_candidate_ai(req_struct, cand_text)
+        ai_eval = compare_candidate_ai(requirements_structured, candidate_text)
 
-        # -------------------------
-        # 3) GENERATE PDF
-        # -------------------------
-        pdf_path, pdf_file = generate_pdf(
-            requirements_text=req_text,
-            requirements_struct=req_struct,
-            candidate_file=f.filename,
-            candidate_text=cand_text,
-            ai_eval_json=ai_eval
-        )
-
-        reports.append({
-            "candidate": f.filename,
-            "pdf_file": pdf_file,
-            "download_url": f"/download_report/{pdf_file}"
+        candidate_results.append({
+            "kandidāts": f.filename,
+            "vērtējums": ai_eval
         })
 
-    return {
-        "status": "OK",
-        "reports": reports
+
+    # -------------------------------------
+    # 3) BUILD FINAL JSON
+    # -------------------------------------
+
+    result = {
+        "prasību_analīze": requirements_structured,
+        "kandidātu_rezultāti": candidate_results
     }
 
+    # -------------------------------------
+    # 4) GENERATE PDF
+    # -------------------------------------
 
-# =================================================
-# DOWNLOAD ENDPOINT
-# =================================================
-
-@app.get("/download_report/{filename}")
-async def download_report(filename: str):
-
-    path = f"/tmp/pdf_reports/{filename}"
-
-    if not os.path.exists(path):
-        raise HTTPException(404, "PDF not found")
+    pdf_path = generate_pdf_report(result)
 
     return FileResponse(
-        path,
+        pdf_path,
         media_type="application/pdf",
-        filename=filename
+        filename="vertējums.pdf"
     )
