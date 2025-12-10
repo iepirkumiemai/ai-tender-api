@@ -1,5 +1,5 @@
 # ===============================================
-# main.py — Tender Comparison API v8.0
+# main.py — Tender Comparison Engine v1.0 (Stable Upload Version)
 # ===============================================
 
 import os
@@ -10,26 +10,30 @@ from fastapi.responses import JSONResponse
 from typing import List
 import mammoth
 from pdfminer.high_level import extract_text
-from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ======================================================
+# FASTAPI INIT
+# ======================================================
 
 app = FastAPI(
     title="AI Tender Comparison Engine",
-    version="8.0",
-    description="Uploads multiple requirement files + multiple candidate ZIP archives and compares them using GPT-4.1."
+    version="1.0-upload-stable",
+    description="Uploads requirement files + candidate ZIP archives. File extraction ready. AI analysis added later."
 )
 
+
 # ======================================================
-#   TEXT CLEANER
+# HELPERS
 # ======================================================
 
 def clean(text: str) -> str:
+    if not text:
+        return ""
     return text.replace("\x00", "").strip()
 
 
 # ======================================================
-#   FILE EXTRACTORS
+# FILE EXTRACTORS
 # ======================================================
 
 def extract_pdf(path: str) -> str:
@@ -42,8 +46,8 @@ def extract_pdf(path: str) -> str:
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
-            result = mammoth.extract_raw_text(f)
-            return clean(result.value)
+            text = mammoth.extract_raw_text(f).value
+            return clean(text)
     except:
         return ""
 
@@ -54,7 +58,11 @@ def extract_edoc(path: str) -> str:
         with zipfile.ZipFile(path, "r") as z:
             for name in z.namelist():
                 if name.endswith(".xml") or name.endswith(".txt"):
-                    text += clean(z.read(name).decode(errors="ignore"))
+                    try:
+                        raw = z.read(name).decode(errors="ignore")
+                        text += clean(raw)
+                    except:
+                        continue
     except:
         pass
     return text
@@ -69,174 +77,107 @@ def extract_zip(path: str) -> str:
             if name.endswith("/"):
                 continue
 
+            # Save temp file
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(z.read(name))
                 tmp_path = tmp.name
 
-            if name.lower().endswith(".pdf"):
+            # Detect type
+            low = name.lower()
+
+            if low.endswith(".pdf"):
                 combined += extract_pdf(tmp_path)
 
-            elif name.lower().endswith(".docx"):
+            elif low.endswith(".docx"):
                 combined += extract_docx(tmp_path)
 
-            elif name.lower().endswith(".edoc"):
+            elif low.endswith(".edoc"):
                 combined += extract_edoc(tmp_path)
 
-            elif name.lower().endswith(".zip"):
+            elif low.endswith(".zip"):
                 combined += extract_zip(tmp_path)
 
+            # Delete temp file
             os.unlink(tmp_path)
 
     return combined
 
 
 # ======================================================
-#   AI — GPT-4.1 REQUIREMENT PARSER
-# ======================================================
-
-def parse_requirements_ai(text: str) -> dict:
-    prompt = f"""
-Extract and structure these requirement documents.
-
-Return JSON:
-{{
-  "requirements": [...],
-  "summary": "...",
-  "key_points": [...],
-  "risk_flags": [...]
-}}
-Document text:
-{text}
-"""
-
-    response = client.responses.create(
-        model="gpt-4.1",
-        input=prompt
-    )
-
-    return response.output_text
-
-
-# ======================================================
-#   AI — GPT-4.1 CANDIDATE EVALUATION
-# ======================================================
-
-def compare_candidate_ai(requirements: str, candidate_text: str) -> dict:
-    prompt = f"""
-Compare this candidate document against the requirements.
-
-Return JSON:
-
-{{
-  "match_score": 0-100,
-  "status": "GREEN | YELLOW | RED",
-  "matched_requirements": [...],
-  "missing_requirements": [...],
-  "risks": [...],
-  "summary": "..."
-}}
-
-REQUIREMENTS:
-{requirements}
-
-CANDIDATE DOCUMENT:
-{candidate_text}
-"""
-
-    response = client.responses.create(
-        model="gpt-4.1",
-        input=prompt
-    )
-
-    return response.output_text
-
-
-# ======================================================
-#   MAIN ENDPOINT — /compare_files
+# MAIN ENDPOINT — /compare_files (WITH REAL UPLOAD INPUTS)
 # ======================================================
 
 @app.post("/compare_files")
 async def compare_files(
-    requirements: List[UploadFile] = File(...),
-    candidates: List[UploadFile] = File(...)
+    dummy: str = Form("x"),                     # fixes Swagger bug
+    requirements: List[UploadFile] = File(..., description="Requirement documents (PDF, DOCX, EDOC, ZIP)"),
+    candidates: List[UploadFile] = File(..., description="Candidate ZIP archives")
 ):
 
     # ======================================================
-    #   1) EXTRACT REQUIREMENTS
+    # 1) EXTRACT ALL REQUIREMENTS
     # ======================================================
 
-    full_req_text = ""
+    full_requirements_text = ""
 
-    for f in requirements:
+    for file in requirements:
+
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(await f.read())
+            tmp.write(await file.read())
             p = tmp.name
 
-        name = f.filename.lower()
+        name = file.filename.lower()
 
         if name.endswith(".pdf"):
-            full_req_text += extract_pdf(p)
+            full_requirements_text += extract_pdf(p)
         elif name.endswith(".docx"):
-            full_req_text += extract_docx(p)
+            full_requirements_text += extract_docx(p)
         elif name.endswith(".edoc"):
-            full_req_text += extract_edoc(p)
+            full_requirements_text += extract_edoc(p)
         elif name.endswith(".zip"):
-            full_req_text += extract_zip(p)
+            full_requirements_text += extract_zip(p)
         else:
-            raise HTTPException(400, f"Unsupported requirement file: {name}")
+            raise HTTPException(400, f"Unsupported requirement file: {file.filename}")
 
         os.unlink(p)
 
-    if not full_req_text.strip():
-        return {"error": "No readable text in requirements."}
-
-    # Parse requirements using GPT-4.1
-    req_structured = parse_requirements_ai(full_req_text)
+    if not full_requirements_text.strip():
+        return {"error": "No readable text extracted from requirement files."}
 
 
     # ======================================================
-    #   2) EXTRACT CANDIDATES
+    # 2) EXTRACT ALL CANDIDATES
     # ======================================================
 
-    candidate_results = []
+    extracted_candidates = []
 
-    for f in candidates:
+    for file in candidates:
 
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(await f.read())
+            tmp.write(await file.read())
             p = tmp.name
 
-        name = f.filename.lower()
+        name = file.filename.lower()
 
         if not name.endswith(".zip"):
-            raise HTTPException(400, f"Candidate must be ZIP: {name}")
+            raise HTTPException(400, f"Candidate must be ZIP: {file.filename}")
 
         candidate_text = extract_zip(p)
         os.unlink(p)
 
-        if not candidate_text.strip():
-            candidate_results.append({
-                "candidate": f.filename,
-                "status": "RED",
-                "reason": "Empty or unreadable candidate.",
-            })
-            continue
-
-        # GPT-4.1 comparison
-        ai_eval = compare_candidate_ai(req_structured, candidate_text)
-
-        candidate_results.append({
-            "candidate": f.filename,
-            "evaluation": ai_eval
+        extracted_candidates.append({
+            "filename": file.filename,
+            "text_length": len(candidate_text),
+            "text_preview": candidate_text[:500]
         })
 
-
     # ======================================================
-    #   3) FINAL RESPONSE
+    # RETURN — READY FOR AI LATER
     # ======================================================
 
     return {
         "status": "OK",
-        "requirements_parsed": req_structured,
-        "candidates": candidate_results
+        "requirements_extracted": len(full_requirements_text),
+        "requirements_preview": full_requirements_text[:500],
+        "candidates_processed": extracted_candidates
     }
