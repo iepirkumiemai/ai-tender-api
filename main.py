@@ -1,57 +1,43 @@
 # ===============================================
-# main.py — Tender Comparison API v12 (PDF-ready)
+# main.py — Tender Comparison Engine v12
+# Stabils Unicode PDF + AI salīdzināšana
 # ===============================================
 
 import os
 import zipfile
 import tempfile
-from typing import List
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse
-
+from fastapi.responses import JSONResponse
+from typing import List
 import mammoth
 from pdfminer.high_level import extract_text
-from fpdf import FPDF
 from openai import OpenAI
-
-
-# ======================================================
-# OPENAI CLIENT
-# ======================================================
+from fpdf import FPDF
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-# ======================================================
-# FASTAPI INIT
-# ======================================================
 
 app = FastAPI(
     title="AI Tender Comparison Engine",
     version="12.0",
-    description="Uploads requirement documents + candidate ZIP files, compares them using GPT-4.1 and returns a PDF report."
+    description="Uploads requirement files + candidate ZIP archives, compares them and generates a downloadable PDF."
 )
 
-
-# ======================================================
-# CLEAN TEXT UTILITY
-# ======================================================
+# ===============================================
+# HELPERS
+# ===============================================
 
 def clean(text: str) -> str:
     return text.replace("\x00", "").strip()
 
-
-# ======================================================
-#   FILE EXTRACTORS
-# ======================================================
+# ===============================================
+# FILE EXTRACTORS
+# ===============================================
 
 def extract_pdf(path: str) -> str:
     try:
         return clean(extract_text(path))
     except:
         return ""
-
 
 def extract_docx(path: str) -> str:
     try:
@@ -60,7 +46,6 @@ def extract_docx(path: str) -> str:
             return clean(result.value)
     except:
         return ""
-
 
 def extract_edoc(path: str) -> str:
     text = ""
@@ -73,13 +58,10 @@ def extract_edoc(path: str) -> str:
         pass
     return text
 
-
 def extract_zip(path: str) -> str:
     combined = ""
-
     with zipfile.ZipFile(path, "r") as z:
         for name in z.namelist():
-
             if name.endswith("/"):
                 continue
 
@@ -89,13 +71,10 @@ def extract_zip(path: str) -> str:
 
             if name.lower().endswith(".pdf"):
                 combined += extract_pdf(tmp_path)
-
             elif name.lower().endswith(".docx"):
                 combined += extract_docx(tmp_path)
-
             elif name.lower().endswith(".edoc"):
                 combined += extract_edoc(tmp_path)
-
             elif name.lower().endswith(".zip"):
                 combined += extract_zip(tmp_path)
 
@@ -103,108 +82,106 @@ def extract_zip(path: str) -> str:
 
     return combined
 
+# ===============================================
+# AI — GPT-4.1 REQUIREMENTS
+# ===============================================
 
-# ======================================================
-#   AI — REQUIREMENT PARSER (GPT-4.1)
-# ======================================================
-
-def parse_requirements_ai(text: str) -> dict:
-
+def parse_requirements_ai(text: str) -> str:
     prompt = f"""
-Izvelc prasības no dokumentiem un strukturē tās JSON formātā.
-
-Atgriez JSON:
+Izvelc prasības no dokumentiem un atgriez JSON formātā:
 
 {{
   "prasības": [...],
   "kopsavilkums": "...",
-  "galvenie_punkti": [...],
-  "riski": [...]
+  "riski": [...],
+  "svarīgākie_punkti": [...]
 }}
 
-Teksts:
+Dokuments:
 {text}
-    """
-
+"""
     response = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
-
     return response.output_text
 
+# ===============================================
+# AI — GPT-4.1 CANDIDATE EVALUATION
+# ===============================================
 
-# ======================================================
-#   AI — CANDIDATE COMPARISON (GPT-4.1)
-# ======================================================
-
-def compare_candidate_ai(requirements_structured: str, candidate_text: str) -> dict:
-
+def compare_candidate_ai(requirements: str, candidate_text: str) -> str:
     prompt = f"""
-Salīdzini kandidāta dokumentus ar prasībām.
+Salīdzini kandidātu ar prasībām.
 
-Atgriez JSON formātā:
+Atgriez JSON:
 
 {{
   "status": "zaļš | dzeltens | sarkans",
+  "score": 0-100,
   "atbilst": [...],
   "neatbilst": [...],
-  "jāpārbauda_manuāli": [...],
+  "vajag_pārbaudīt": [...],
   "kopsavilkums": "..."
 }}
 
 PRASĪBAS:
-{requirements_structured}
+{requirements}
 
-KANDIDĀTS:
+KANDIDĀTA DOKUMENTS:
 {candidate_text}
-    """
-
+"""
     response = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
-
     return response.output_text
 
+# ===============================================
+# PDF GENERATOR (UNICODE)
+# ===============================================
 
-# ======================================================
-# PDF GENERATOR (Helvetica, Railway-safe)
-# ======================================================
-
-def generate_pdf_report(result_json: dict) -> str:
-
-    base_dir = "/tmp/reports"
-    os.makedirs(base_dir, exist_ok=True)
-
-    pdf_path = f"{base_dir}/vertējums.pdf"
-
+def generate_pdf_report(result: dict) -> str:
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=12)
 
-    pdf.set_font("Helvetica", size=16)
+    # --- Add Unicode font ---
+    FONT_PATH = "/app/NotoSans-Regular.ttf"
+
+    if not os.path.exists(FONT_PATH):
+        # create a fallback font
+        FONT_PATH = "/tmp/NotoSans-Regular.ttf"
+        with open(FONT_PATH, "wb") as f:
+            f.write(open("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "rb").read())
+
+    pdf.add_font("Noto", "", FONT_PATH, uni=True)
+    pdf.set_font("Noto", size=14)
+
     pdf.cell(0, 10, "Vērtējums", ln=True)
 
-    pdf.set_font("Helvetica", size=11)
+    pdf.set_font("Noto", size=11)
+    pdf.multi_cell(0, 7, result["summary"])
 
-    # vienkārši izdrukā visu JSON kā tekstu
-    for key, value in result_json.items():
-        pdf.set_font("Helvetica", size=12)
-        pdf.multi_cell(0, 8, f"{key}:")
+    # candidate list
+    pdf.ln(5)
+    pdf.set_font("Noto", size=12)
+    pdf.cell(0, 10, "Kandidāti:", ln=True)
 
-        pdf.set_font("Helvetica", size=11)
-        pdf.multi_cell(0, 6, str(value))
+    for cand in result["candidates"]:
+        pdf.set_font("Noto", size=11)
+        pdf.multi_cell(
+            0, 6,
+            f"{cand['name']} — status: {cand['status']} (score: {cand['score']})"
+        )
         pdf.ln(2)
 
-    pdf.output(pdf_path)
+    out_path = f"/tmp/report_{os.getpid()}.pdf"
+    pdf.output(out_path)
+    return out_path
 
-    return pdf_path
-
-
-# ======================================================
-#   MAIN ENDPOINT — /compare_files_with_pdf
-# ======================================================
+# ===============================================
+# MAIN ENDPOINT — /compare_files_with_pdf
+# ===============================================
 
 @app.post("/compare_files_with_pdf")
 async def compare_files_with_pdf(
@@ -212,91 +189,66 @@ async def compare_files_with_pdf(
     candidates: List[UploadFile] = File(...)
 ):
 
-    # -------------------------------------
-    # 1) EXTRACT REQUIREMENTS
-    # -------------------------------------
-
+    # 1) Extract requirement text
     req_text = ""
-
     for f in requirements:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
 
-        filename = f.filename.lower()
-
-        if filename.endswith(".pdf"):
+        if f.filename.lower().endswith(".pdf"):
             req_text += extract_pdf(p)
-        elif filename.endswith(".docx"):
+        elif f.filename.lower().endswith(".docx"):
             req_text += extract_docx(p)
-        elif filename.endswith(".edoc"):
+        elif f.filename.lower().endswith(".edoc"):
             req_text += extract_edoc(p)
-        elif filename.endswith(".zip"):
+        elif f.filename.lower().endswith(".zip"):
             req_text += extract_zip(p)
-        else:
-            raise HTTPException(400, f"Nepareizs prasību faila tips: {filename}")
 
         os.unlink(p)
 
     if not req_text.strip():
-        raise HTTPException(400, "Prasību failos nav nolasāma teksta.")
+        raise HTTPException(400, "Nevar nolasīt prasību dokumentus.")
 
-    requirements_structured = parse_requirements_ai(req_text)
+    req_struct = parse_requirements_ai(req_text)
 
-
-    # -------------------------------------
-    # 2) PROCESS CANDIDATES
-    # -------------------------------------
-
-    candidate_results = []
-
+    # 2) Extract + analyze candidates
+    results = []
     for f in candidates:
-
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
-
-        filename = f.filename.lower()
-
-        if not filename.endswith(".zip"):
-            raise HTTPException(400, f"Kandidāta fails nav ZIP: {filename}")
 
         candidate_text = extract_zip(p)
         os.unlink(p)
 
         if not candidate_text.strip():
-            candidate_results.append({
-                "kandidāts": f.filename,
-                "status": "sarkans",
-                "kļūda": "Tukšs vai nenolasāms ZIP."
-            })
+            results.append({"name": f.filename, "status": "sarkans", "summary": "Tukšs fails", "score": 0})
             continue
 
-        ai_eval = compare_candidate_ai(requirements_structured, candidate_text)
+        ai_eval = compare_candidate_ai(req_struct, candidate_text)
 
-        candidate_results.append({
-            "kandidāts": f.filename,
-            "vērtējums": ai_eval
+        results.append({
+            "name": f.filename,
+            **eval(ai_eval)  # Convert string JSON → dict
         })
 
+    # 3) Build combined summary for PDF
+    summary = "Kopsavilkums par vērtējumu"
 
-    # -------------------------------------
-    # 3) BUILD FINAL JSON
-    # -------------------------------------
-
-    result = {
-        "prasību_analīze": requirements_structured,
-        "kandidātu_rezultāti": candidate_results
+    full_result = {
+        "summary": summary,
+        "candidates": results
     }
 
-    # -------------------------------------
-    # 4) GENERATE PDF
-    # -------------------------------------
+    # 4) Generate PDF
+    pdf_path = generate_pdf_report(full_result)
 
-    pdf_path = generate_pdf_report(result)
+    # 5) Railway download link
+    download_url = f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}/download/{os.path.basename(pdf_path)}"
 
-    return FileResponse(
-        pdf_path,
-        media_type="application/pdf",
-        filename="vertējums.pdf"
-    )
+    return {
+        "status": "OK",
+        "pdf_url": download_url,
+        "raw": full_result
+    }
