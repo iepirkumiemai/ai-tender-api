@@ -11,13 +11,12 @@ from openai import OpenAI
 import pdfminer.high_level
 import mammoth
 
-app = FastAPI(title="AI Tender Analyzer API", version="5.2")
+app = FastAPI(title="AI Tender Analyzer API", version="5.3")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
 # ============================================================
-# Global SAFE LIMITS
+# SAFE LIMITS
 # ============================================================
 
 MAX_ZIP_SIZE_MB = 40
@@ -27,7 +26,7 @@ CHUNK_SIZE = 50_000
 
 
 # ============================================================
-# Time-limited executor
+# Timeout support
 # ============================================================
 
 class TimeoutError(Exception):
@@ -48,29 +47,29 @@ def split_text_into_chunks(text: str, max_chars: int = CHUNK_SIZE):
 
 
 # ============================================================
-# Extractors with SAFE LIMITS
+# Extractors
 # ============================================================
 
-def extract_pdf(file_path: str) -> str:
+def extract_pdf(path: str) -> str:
     try:
-        return pdfminer.high_level.extract_text(file_path)
+        return pdfminer.high_level.extract_text(path)
     except:
         return ""
 
 
-def extract_docx(file_path: str) -> str:
+def extract_docx(path: str) -> str:
     try:
-        with open(file_path, "rb") as f:
-            result = mammoth.convert_to_html(f)
-            return result.value.replace("<p>", "\n").replace("</p>", "\n")
+        with open(path, "rb") as f:
+            html = mammoth.convert_to_html(f).value
+            return html.replace("<p>", "\n").replace("</p>", "\n")
     except:
         return ""
 
 
-def extract_edoc(file_path: str) -> str:
+def extract_edoc(path: str) -> str:
     out = []
     try:
-        with zipfile.ZipFile(file_path, "r") as z:
+        with zipfile.ZipFile(path, "r") as z:
             for name in z.namelist():
                 try:
                     content = z.read(name)
@@ -83,56 +82,39 @@ def extract_edoc(file_path: str) -> str:
     return "\n".join(out)
 
 
-def safe_extract_zip(file_path: str) -> Dict[str, str]:
-    """
-    Extracts ZIP content with:
-    - file count limit
-    - timeout per file
-    - text size limit
-    - formats: PDF, DOCX, EDOC, TXT
-    """
-
-    output = {}
-    text_size = 0
+def safe_extract_zip(path: str) -> str:
+    """Extract ZIP, respecting SAFE LIMITS, return concatenated text only."""
+    final_text = []
+    total_size = 0
 
     try:
-        with zipfile.ZipFile(file_path, "r") as z:
-
+        with zipfile.ZipFile(path, "r") as z:
             names = z.namelist()
 
-            # ---- Limit file count ----
             if len(names) > MAX_ZIP_FILES:
-                return {"ERROR": f"SAFE_LIMIT_EXCEEDED: ZIP contains {len(names)} files (max {MAX_ZIP_FILES})."}
+                return "[LIMIT] Too many files in ZIP."
 
             for name in names:
-
-                # TIMEOUT: 2 sec extraction
+                # timeout 2 sec
                 signal.alarm(2)
-
                 try:
                     extracted = z.extract(name, tempfile.gettempdir())
-                except Exception:
+                except:
                     continue
                 finally:
                     signal.alarm(0)
 
-                ext = name.lower()
-
-                # ---- Determine type and extract ----
                 text = ""
+                lower = name.lower()
 
                 try:
-                    if ext.endswith(".pdf"):
+                    if lower.endswith(".pdf"):
                         text = extract_pdf(extracted)
-
-                    elif ext.endswith(".docx"):
+                    elif lower.endswith(".docx"):
                         text = extract_docx(extracted)
-
-                    elif ext.endswith(".edoc"):
+                    elif lower.endswith(".edoc"):
                         text = extract_edoc(extracted)
-
                     else:
-                        # Try plain text
                         try:
                             with open(extracted, "r", encoding="utf-8", errors="ignore") as f:
                                 text = f.read()
@@ -141,115 +123,106 @@ def safe_extract_zip(file_path: str) -> Dict[str, str]:
                 except:
                     text = ""
 
-                # ---- SAFE LIMIT: total text size ----
-                text_size += len(text)
-                if text_size > MAX_TEXT_SIZE:
-                    output[name] = text[:50_000] + "\n[SAFE TRIMMED]"
-                    return output
+                total_size += len(text)
+                if total_size > MAX_TEXT_SIZE:
+                    final_text.append(text[:50000])
+                    break
 
-                output[name] = text
+                final_text.append(text)
 
     except Exception:
-        return {"ERROR": "Invalid or unreadable ZIP file."}
+        return "[ERROR] Invalid ZIP"
 
-    return output
+    return "\n".join(final_text)
 
 
 # ============================================================
-# AI ANALYSIS (chunk-safe)
+# AI ANALYSIS – only returns structured summary
 # ============================================================
 
 def analyze_large_text(text: str) -> Dict[str, Any]:
     chunks = split_text_into_chunks(text)
-    results = {
-        "summary": "",
-        "compliance_score": 0,
-        "non_compliance_items": [],
-        "recommendations": [],
-        "chunks_analyzed": len(chunks)
-    }
+    summaries = []
+    noncomp = []
+    recs = []
+
+    score_total = 0
 
     for idx, chunk in enumerate(chunks):
         try:
             response = client.responses.create(
                 model="gpt-4.1",
                 input=[
-                    {"role": "system", "content": "Tender analysis assistant. Analyze the chunk."},
-                    {"role": "user", "content": f"Chunk {idx+1}:\n{chunk}"}
+                    {"role": "system", "content": "Summarize and evaluate tender content."},
+                    {"role": "user", "content": f"Analyze chunk {idx+1}:\n{chunk}"}
                 ],
             )
 
             txt = response.output_text
-            results["summary"] += f"\n[Chunk {idx+1}] {txt}"
 
-            results["compliance_score"] += 0.5
-            results["non_compliance_items"].append(f"Chunk {idx+1}: review needed")
-            results["recommendations"].append(f"Improve chunk {idx+1} clarity")
+            summaries.append(f"[Chunk {idx+1}] {txt}")
+            noncomp.append(f"Chunk {idx+1}: review needed")
+            recs.append(f"Improve chunk {idx+1} clarity")
+
+            score_total += 0.5
+
         except Exception as e:
-            results["summary"] += f"\n[Chunk {idx+1}] AI_ERROR: {str(e)}"
+            summaries.append(f"[Chunk {idx+1}] AI_ERROR: {str(e)}")
 
-    if chunks:
-        results["compliance_score"] = round(results["compliance_score"] / len(chunks), 3)
+    avg_score = round(score_total / max(1, len(chunks)), 3)
 
-    return results
+    return {
+        "summary": "\n".join(summaries[:5]),     # ONLY FIRST 5 summaries (lightweight)
+        "compliance_score": avg_score,
+        "non_compliance_items": noncomp[:10],    # lightweight
+        "recommendations": recs[:10],            # lightweight
+        "chunks": len(chunks)
+    }
 
 
 # ============================================================
-# UPLOAD ENDPOINT (SAFE)
+# UPLOAD ENDPOINT — SAFE OUTPUT (Swagger-friendly)
 # ============================================================
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
 
-    # ---- SAFE LIMIT: ZIP size ----
     size_mb = len(await file.read()) / (1024 * 1024)
     await file.seek(0)
 
     if size_mb > MAX_ZIP_SIZE_MB:
-        return JSONResponse(
-            {"error": f"SAFE_LIMIT_EXCEEDED: ZIP is {size_mb:.1f}MB (max {MAX_ZIP_SIZE_MB}MB)."},
-            status_code=400
-        )
+        return JSONResponse({"error": f"ZIP too large ({size_mb:.1f} MB)"}, status_code=400)
 
     suffix = os.path.splitext(file.filename)[1].lower()
-    temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-    os.close(temp_fd)
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
 
     with open(temp_path, "wb") as f:
         f.write(await file.read())
 
-    # ---- Extract depending on type ----
     if suffix == ".zip":
-        zip_data = safe_extract_zip(temp_path)
-
-        if "ERROR" in zip_data:
-            return JSONResponse({"status": "ERROR", "message": zip_data["ERROR"]}, status_code=400)
-
-        full_text = "\n".join(zip_data.values())
-
+        text = safe_extract_zip(temp_path)
     elif suffix == ".pdf":
-        full_text = extract_pdf(temp_path)
-
+        text = extract_pdf(temp_path)
     elif suffix == ".docx":
-        full_text = extract_docx(temp_path)
-
+        text = extract_docx(temp_path)
     elif suffix == ".edoc":
-        full_text = extract_edoc(temp_path)
-
+        text = extract_edoc(temp_path)
     else:
         return JSONResponse({"error": "Unsupported format"}, status_code=400)
 
-    # ---- SAFE LIMIT: Trim text ----
-    if len(full_text) > MAX_TEXT_SIZE:
-        full_text = full_text[:MAX_TEXT_SIZE] + "\n[SAFE TRIMMED]"
+    if len(text) > MAX_TEXT_SIZE:
+        text = text[:MAX_TEXT_SIZE]
 
-    # ---- AI Analysis ----
-    ai_result = analyze_large_text(full_text)
+    ai = analyze_large_text(text)
 
     return JSONResponse({
         "status": "OK",
         "filename": file.filename,
         "file_type": suffix,
-        "text_length": len(full_text),
-        "ai_analysis": ai_result
+        "ai_summary": ai["summary"],
+        "compliance_score": ai["compliance_score"],
+        "non_compliance_items": ai["non_compliance_items"],
+        "recommendations": ai["recommendations"],
+        "chunks": ai["chunks"]
     })
