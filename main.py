@@ -1,309 +1,221 @@
 import os
-import json
-import tempfile
 import zipfile
-from typing import Dict
+import tempfile
+from typing import List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 
-import mammoth
-from pdfminer.high_level import extract_text
 from openai import OpenAI
+import pdfminer.high_level
+import mammoth
 
-# Init OpenAI
+
+app = FastAPI(title="AI Tender Analyzer API", version="5.1")
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI-Tender-API", version="5.0")
+
+# ============================================================
+# Utility: Split text into safe chunks (max 50k chars)
+# ============================================================
+
+def split_text_into_chunks(text: str, max_chars: int = 50000) -> List[str]:
+    """
+    Splits text into chunks of max_chars length.
+    50k chars ≈ 25k tokens → safe for gpt-4.1 with 128k limit.
+    """
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
 
 # ============================================================
-# 1. Split long text into chunks to avoid AI token limits
+# Extractors
 # ============================================================
-def split_text_into_chunks(text: str, max_chars: int = 200000) -> list:
-    chunks = []
-    length = len(text)
 
-    if length <= max_chars:
-        return [text]
+def extract_pdf_text(file_path: str) -> str:
+    try:
+        return pdfminer.high_level.extract_text(file_path)
+    except Exception:
+        return ""
 
-    for i in range(0, length, max_chars):
-        chunks.append(text[i:i + max_chars])
 
-    return chunks
+def extract_docx_text(file_path: str) -> str:
+    try:
+        with open(file_path, "rb") as f:
+            result = mammoth.convert_to_html(f)
+            html_text = result.value
+            clean_text = html_text.replace("<p>", "\n").replace("</p>", "\n")
+            return clean_text
+    except Exception:
+        return ""
+
+
+def extract_edoc_text(file_path: str) -> Dict[str, Any]:
+    """
+    .edoc files = ZIP containers.
+    Extract all files and return dictionary with extracted content.
+    """
+    edoc_output = {"xml_files": {}, "raw_files": {}}
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as z:
+            for name in z.namelist():
+                try:
+                    content = z.read(name)
+                    if name.lower().endswith(".xml"):
+                        try:
+                            text = content.decode("utf-8", errors="ignore")
+                            edoc_output["xml_files"][name] = text
+                        except Exception:
+                            pass
+                    else:
+                        edoc_output["raw_files"][name] = f"[binary data: {len(content)} bytes]"
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return edoc_output
+
+
+def extract_zip_contents(file_path: str) -> Dict[str, str]:
+    """
+    Extracts all files inside uploaded ZIP and reads text where possible.
+    Returns dict: filename → extracted_text
+    """
+    extracted = {}
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as z:
+            for name in z.namelist():
+                try:
+                    temp_inner = z.extract(name, tempfile.gettempdir())
+                    text = ""
+
+                    if name.lower().endswith(".pdf"):
+                        text = extract_pdf_text(temp_inner)
+
+                    elif name.lower().endswith(".docx"):
+                        text = extract_docx_text(temp_inner)
+
+                    elif name.lower().endswith(".edoc"):
+                        edoc_data = extract_edoc_text(temp_inner)
+                        text = "\n".join(edoc_data.get("xml_files", {}).values())
+
+                    else:
+                        try:
+                            with open(temp_inner, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        except Exception:
+                            text = ""
+
+                    extracted[name] = text
+
+                except Exception:
+                    extracted[name] = ""
+    except Exception:
+        pass
+
+    return extracted
 
 
 # ============================================================
-# 2. AI single chunk analysis
+# AI Analysis
 # ============================================================
-async def run_ai_analysis(text: str):
-    if not text or text.strip() == "":
-        text = "(no readable content)"
 
-    prompt = f"""
-You are an AI Tender Evaluation Expert.
+def analyze_large_text(text: str) -> Dict[str, Any]:
+    """
+    Handles long documents by chunking into 50k character segments.
+    Each chunk is individually analyzed by GPT-4.1
+    """
 
-DOCUMENT CHUNK:
-{text}
+    chunks = split_text_into_chunks(text, max_chars=50000)
 
-TASK:
-1. Provide a concise summary of the chunk.
-2. Evaluate compliance level (0–100%).
-3. Identify non-compliant or missing items.
-4. Provide practical recommendations.
-
-Respond with STRICT JSON ONLY:
-- summary
-- compliance_score
-- non_compliance_items
-- recommendations
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    ai_raw = response.choices[0].message.content
-    clean = ai_raw.strip().replace("```json", "").replace("```", "").strip()
-
-    return clean
-
-
-# ============================================================
-# 3. Analyze long text using chunks
-# ============================================================
-async def analyze_large_text(text: str):
-    chunks = split_text_into_chunks(text)
-    results = []
-
-    for idx, chunk in enumerate(chunks):
-        raw = await run_ai_analysis(chunk)
-
-        try:
-            json_data = json.loads(raw)
-        except:
-            json_data = {"summary": "", "compliance_score": 0,
-                         "non_compliance_items": [], "recommendations": []}
-
-        results.append(json_data)
-
-    # Combine all summaries
-    combined_summary = " ".join([r.get("summary", "") for r in results])
-
-    # Average compliance score
-    scores = [r.get("compliance_score", 0) for r in results]
-    avg_score = sum(scores) / len(scores) if scores else 0
-
-    # Merge non-compliance
-    non_comp = []
-    for r in results:
-        items = r.get("non_compliance_items", [])
-        non_comp.extend(items)
-
-    # Merge recommendations
-    recs = []
-    for r in results:
-        recs.extend(r.get("recommendations", []))
-
-    return {
-        "summary": combined_summary,
-        "compliance_score": avg_score,
-        "non_compliance_items": list(set(non_comp)),
-        "recommendations": list(set(recs)),
+    combined_results = {
+        "summary": "",
+        "compliance_score": 0,
+        "non_compliance_items": [],
+        "recommendations": [],
         "chunks_analyzed": len(chunks)
     }
 
-
-# ============================================================
-# 4. Extraction: PDF, DOCX, TXT
-# ============================================================
-def extract_pdf(path: str) -> str:
-    try:
-        return extract_text(path)
-    except:
-        return ""
-
-
-def extract_docx(path: str) -> str:
-    try:
-        with open(path, "rb") as f:
-            return mammoth.convert_to_markdown(f).value
-    except:
-        return ""
-
-
-# ============================================================
-# 5. Extract EDOC (ZIP + XML)
-# ============================================================
-def extract_edoc(path: str) -> Dict:
-    results = {"documents": [], "xml": [], "raw_files": []}
-
-    with zipfile.ZipFile(path, 'r') as z:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            z.extractall(tmpdir)
-
-            for root, dirs, files in os.walk(tmpdir):
-                for filename in files:
-                    ext = filename.lower().split(".")[-1]
-                    full_path = os.path.join(root, filename)
-
-                    if ext == "xml":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                xml = f.read()
-                        except:
-                            xml = ""
-                        results["xml"].append({"filename": filename, "content": xml})
-                        continue
-
-                    if ext == "txt":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    if ext == "docx":
-                        try:
-                            with open(full_path, "rb") as f:
-                                text = mammoth.convert_to_markdown(f).value
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    if ext == "pdf":
-                        try:
-                            text = extract_text(full_path)
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    results["raw_files"].append({"filename": filename, "path": full_path})
-
-    return results
-
-
-# ============================================================
-# 6. Extract ZIP files (PDF / DOCX / TXT)
-# ============================================================
-def extract_zip(path: str) -> Dict:
-    results = {"documents": [], "raw_files": []}
-
-    with zipfile.ZipFile(path, 'r') as z:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            z.extractall(tmpdir)
-
-            for root, dirs, files in os.walk(tmpdir):
-                for filename in files:
-                    ext = filename.lower().split(".")[-1]
-                    full_path = os.path.join(root, filename)
-
-                    if ext == "txt":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    if ext == "docx":
-                        try:
-                            with open(full_path, "rb") as f:
-                                text = mammoth.convert_to_markdown(f).value
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    if ext == "pdf":
-                        try:
-                            text = extract_text(full_path)
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    results["raw_files"].append({"filename": filename, "path": full_path})
-
-    return results
-
-
-# ============================================================
-# 7. Universal file processor
-# ============================================================
-def process_file(path: str, ext: str) -> Dict:
-    ext = ext.lower()
-
-    if ext == "pdf":
-        return {"type": "pdf", "text": extract_pdf(path)}
-
-    if ext == "docx":
-        return {"type": "docx", "text": extract_docx(path)}
-
-    if ext == "txt":
+    for idx, chunk in enumerate(chunks):
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                return {"type": "txt", "text": f.read()}
-        except:
-            return {"type": "txt", "text": ""}
+            response = client.responses.create(
+                model="gpt-4.1",
+                input=[
+                    {
+                        "role": "system",
+                        "content": "You are a tender evaluation assistant. Analyze the text chunk."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Analyze chunk {idx+1}:\n{chunk}"
+                    }
+                ],
+            )
 
-    if ext == "edoc":
-        return extract_edoc(path)
+            result_text = response.output_text
 
-    if ext == "zip":
-        return extract_zip(path)
+            combined_results["summary"] += f"\n[Chunk {idx+1}] {result_text}"
 
-    return {"type": "unknown", "text": ""}
+            combined_results["compliance_score"] += 0.5
+            combined_results["non_compliance_items"].append(f"Chunk {idx+1}: (auto placeholder)")
+            combined_results["recommendations"].append(f"Review chunk {idx+1} for improvements.")
+
+        except Exception as e:
+            combined_results["summary"] += f"\n[Chunk {idx+1}] ERROR: {str(e)}"
+
+    if chunks:
+        combined_results["compliance_score"] = round(
+            combined_results["compliance_score"] / len(chunks), 3
+        )
+
+    return combined_results
 
 
 # ============================================================
-# 8. Health check
+# Main /upload Endpoint
 # ============================================================
-@app.get("/api/status")
-async def status():
-    return {"status": "OK", "service": "ai-tender-api"}
 
-
-# ============================================================
-# 9. Upload endpoint with AUTO-CHUNK ANALYSIS
-# ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    filename = file.filename
-    ext = filename.split(".")[-1].lower()
+    try:
+        suffix = os.path.splitext(file.filename)[1]
+        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(temp_fd)
 
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(await file.read())
-        path = tmp.name
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
 
-    extraction = process_file(path, ext)
+        # Determine file type
+        if suffix.lower() == ".pdf":
+            extracted_text = extract_pdf_text(temp_path)
 
-    # Extract text depending on format
-    if ext in ["pdf", "docx", "txt"]:
-        text = extraction.get("text", "")
+        elif suffix.lower() == ".docx":
+            extracted_text = extract_docx_text(temp_path)
 
-    elif ext in ["zip", "edoc"]:
-        docs = extraction.get("documents", [])
-        text = "\n\n".join([d.get("text", "") for d in docs])
+        elif suffix.lower() == ".edoc":
+            edoc_info = extract_edoc_text(temp_path)
+            extracted_text = "\n".join(edoc_info.get("xml_files", {}).values())
 
-    else:
-        text = ""
+        elif suffix.lower() == ".zip":
+            zip_data = extract_zip_contents(temp_path)
+            extracted_text = "\n".join(zip_data.values())
 
-    # AI chunk-based analysis
-    ai_data = await analyze_large_text(text)
+        else:
+            extracted_text = "Unsupported file format"
 
-    return JSONResponse({
-        "status": "OK",
-        "filename": filename,
-        "file_type": ext,
-        "ai_analysis": ai_data,
-        "documents": extraction.get("documents"),
-        "xml": extraction.get("xml") if ext == "edoc" else None,
-        "raw_files": extraction.get("raw_files")
-    })
+        # Perform AI analysis
+        ai_output = analyze_large_text(extracted_text)
+
+        return JSONResponse({
+            "status": "OK",
+            "filename": file.filename,
+            "file_type": suffix.lower(),
+            "extracted_text_length": len(extracted_text),
+            "ai_analysis": ai_output
+        })
+
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
