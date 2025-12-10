@@ -1,42 +1,60 @@
-# ===============================================
-# main.py — AI Tender Engine v10.0 (JSON + PDF)
-# ===============================================
+# ================================================================
+# main.py — Tender Engine v11 (PDF Download Edition)
+# ================================================================
 
 import os
 import zipfile
 import tempfile
-from typing import List
+import base64
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
+from typing import List
 
 import mammoth
 from pdfminer.high_level import extract_text
 from openai import OpenAI
-
 from fpdf import FPDF
 
-# -----------------------------------------------
-# OpenAI klienta inicializācija
-# -----------------------------------------------
+
+# ================================================================
+# OpenAI Client
+# ================================================================
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(
-    title="AI Iepirkumi – Tender Engine",
-    version="10.0",
-    description="AI-based tender evaluation: JSON + Professional PDF output"
+    title="AI Tender Comparison Engine",
+    version="11.0",
+    description="Requirement extraction + candidate ZIP evaluation + PDF output"
 )
 
-# ======================================================
-# Teksta attīrīšana
-# ======================================================
+
+# ================================================================
+# FONT — DejaVuSans encoded in Base64 (Unicode support)
+# ================================================================
+
+DEJAVU_BASE64 = """
+AAEAAAASAQAABAAgR0RFRrRCsIIAAj0AAA ... VERY LONG BASE64 FONT ... AAA==
+""".strip()
+
+FONT_PATH = "/tmp/dejavu.ttf"
+
+if not os.path.exists(FONT_PATH):
+    with open(FONT_PATH, "wb") as f:
+        f.write(base64.b64decode(DEJAVU_BASE64))
+
+
+# ================================================================
+# Helper — Clean text
+# ================================================================
 
 def clean(text: str) -> str:
     return text.replace("\x00", "").strip()
 
-# ======================================================
-# Failu ekstrakcijas metodes
-# ======================================================
+
+# ================================================================
+# Extractors
+# ================================================================
 
 def extract_pdf(path: str) -> str:
     try:
@@ -44,12 +62,15 @@ def extract_pdf(path: str) -> str:
     except:
         return ""
 
+
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
-            return clean(mammoth.extract_raw_text(f).value)
+            result = mammoth.extract_raw_text(f)
+            return clean(result.value)
     except:
         return ""
+
 
 def extract_edoc(path: str) -> str:
     text = ""
@@ -62,191 +83,137 @@ def extract_edoc(path: str) -> str:
         pass
     return text
 
+
 def extract_zip(path: str) -> str:
     combined = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if name.endswith("/"):
-                    continue
 
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    tmp.write(z.read(name))
-                    tmp_path = tmp.name
+    with zipfile.ZipFile(path, "r") as z:
+        for name in z.namelist():
 
-                lname = name.lower()
+            if name.endswith("/"):
+                continue
 
-                if lname.endswith(".pdf"):
-                    combined += extract_pdf(tmp_path)
-                elif lname.endswith(".docx"):
-                    combined += extract_docx(tmp_path)
-                elif lname.endswith(".edoc"):
-                    combined += extract_edoc(tmp_path)
-                elif lname.endswith(".zip"):
-                    combined += extract_zip(tmp_path)
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(z.read(name))
+                temp_path = tmp.name
 
-                os.unlink(tmp_path)
+            if name.lower().endswith(".pdf"):
+                combined += extract_pdf(temp_path)
 
-    except:
-        pass
+            elif name.lower().endswith(".docx"):
+                combined += extract_docx(temp_path)
+
+            elif name.lower().endswith(".edoc"):
+                combined += extract_edoc(temp_path)
+
+            elif name.lower().endswith(".zip"):
+                combined += extract_zip(temp_path)
+
+            os.unlink(temp_path)
 
     return combined
 
-# ======================================================
-# AI – prasību analīze
-# ======================================================
 
-def ai_parse_requirements(text: str) -> str:
+# ================================================================
+# AI — Requirement parsing
+# ================================================================
+
+def parse_requirements_ai(text: str) -> str:
 
     prompt = f"""
-Extract and logically structure these REQUIREMENT DOCUMENTS.
-Return STRICT JSON:
+Extract and structure these requirement documents.
 
+Return JSON:
 {{
   "requirements": [...],
   "summary": "...",
   "key_points": [...],
-  "risks": [...]
+  "risk_flags": [...]
 }}
 
---- DOCUMENT TEXT ---
+DOCUMENT:
 {text}
 """
 
-    r = client.responses.create(
+    response = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
 
-    return r.output_text
+    return response.output_text
 
-# ======================================================
-# AI – kandidāta salīdzinājums
-# ======================================================
 
-def ai_compare_candidate(requirements_json: str, candidate_text: str) -> str:
+# ================================================================
+# AI — Candidate comparison
+# ================================================================
+
+def compare_candidate_ai(requirements_structured: str, candidate_text: str) -> str:
 
     prompt = f"""
-Compare REQUIREMENTS with CANDIDATE DOCUMENT.
+Compare this candidate against structured requirements.
 
-Return STRICT JSON:
-
+Return JSON:
 {{
   "match_score": 0-100,
   "status": "GREEN | YELLOW | RED",
-  "matched_requirements": [...],
-  "missing_requirements": [...],
+  "matched": [...],
+  "missing": [...],
   "risks": [...],
   "summary": "..."
 }}
 
-Rules:
-- GREEN = score >= 90
-- YELLOW = 60–89
-- RED = <60
+REQUIREMENTS:
+{requirements_structured}
 
---- REQUIREMENTS ---
-{requirements_json}
-
---- CANDIDATE ---
+CANDIDATE:
 {candidate_text}
 """
 
-    r = client.responses.create(
+    response = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
 
-    return r.output_text
+    return response.output_text
 
 
-# ======================================================
-#  PDF GENERATORS
-# ======================================================
+# ================================================================
+# PDF GENERATOR
+# ================================================================
 
-class PDFReport(FPDF):
-    def header(self):
-        self.set_font("DejaVu", "B", 18)
-        self.set_text_color(0, 51, 102)
-        self.cell(0, 12, "Vērtējums", ln=True, align="C")
-        self.ln(4)
-        self.set_draw_color(0, 51, 102)
-        self.set_line_width(1)
-        self.line(10, 28, 200, 28)
-        self.ln(6)
+def generate_pdf(requirements: str, results: list) -> str:
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font("DejaVu", "", 9)
-        self.set_text_color(120, 120, 120)
-        self.cell(0, 10, "Generated by AI Tender Engine v10.0", align="C")
+    pdf_path = "/tmp/tender_report.pdf"
 
-
-def generate_pdf(requirements_json, candidate_results):
-
-    pdf = PDFReport()
+    pdf = FPDF()
     pdf.add_page()
 
-    pdf.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", uni=True)
-    pdf.add_font("DejaVu", "B", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", uni=True)
-    pdf.set_font("DejaVu", "", 12)
+    # Add font
+    pdf.add_font("DejaVu", "", FONT_PATH, uni=True)
+    pdf.set_font("DejaVu", size=12)
 
-    # -----------------------------------------
-    # Requirements Summary
-    # -----------------------------------------
-    pdf.set_font("DejaVu", "B", 14)
-    pdf.set_text_color(0, 51, 102)
-    pdf.cell(0, 10, "Prasību kopsavilkums", ln=True)
-
-    pdf.set_font("DejaVu", "", 11)
-    pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(0, 7, requirements_json)
-
+    pdf.multi_cell(0, 8, "AI Tender Comparison Report")
     pdf.ln(4)
 
-    # -----------------------------------------
-    # Candidate Results
-    # -----------------------------------------
-    pdf.set_font("DejaVu", "B", 14)
-    pdf.set_text_color(0, 51, 102)
-    pdf.cell(0, 10, "Kandidātu vērtējums", ln=True)
+    pdf.multi_cell(0, 6, "=== REQUIREMENTS ===")
+    pdf.multi_cell(0, 6, str(requirements))
+    pdf.ln(6)
 
-    for cand in candidate_results:
+    pdf.multi_cell(0, 6, "=== CANDIDATE RESULTS ===")
 
-        pdf.set_font("DejaVu", "B", 12)
-        pdf.ln(3)
-        pdf.cell(0, 8, f"Kandidāts: {cand['candidate']}", ln=True)
-
-        eval = cand["evaluation"]
-
-        # status color + icon
-        if "GREEN" in eval:
-            icon = "✓"
-            pdf.set_text_color(15, 169, 88)
-        elif "YELLOW" in eval:
-            icon = "⚠"
-            pdf.set_text_color(255, 180, 0)
-        else:
-            icon = "✖"
-            pdf.set_text_color(224, 41, 41)
-
-        pdf.set_font("DejaVu", "B", 12)
-        pdf.cell(0, 8, f"Status: {icon} {eval}", ln=True)
-
-        pdf.set_font("DejaVu", "", 11)
-        pdf.set_text_color(0, 0, 0)
-        pdf.multi_cell(0, 6, eval)
+    for c in results:
         pdf.ln(4)
+        pdf.multi_cell(0, 6, f"Candidate: {c['candidate']}")
+        pdf.multi_cell(0, 6, str(c['evaluation']))
 
-    # Save PDF
-    out_path = "/tmp/report.pdf"
-    pdf.output(out_path)
-    return out_path
+    pdf.output(pdf_path)
+
+    return pdf_path
 
 
-# ======================================================
-#   Endpoint: JSON /compare_files
-# ======================================================
+# ================================================================
+# ENDPOINT: /compare_files
+# ================================================================
 
 @app.post("/compare_files")
 async def compare_files(
@@ -254,114 +221,75 @@ async def compare_files(
     candidates: List[UploadFile] = File(...)
 ):
 
-    # Extract REQUIREMENTS
-    text_req = ""
+    # -------------------------
+    # REQUIREMENTS EXTRACTION
+    # -------------------------
+
+    full_requirements_text = ""
+
     for f in requirements:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(await f.read())
-        temp_path = temp.name
-        temp.close()
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(await f.read())
+            p = tmp.name
 
         name = f.filename.lower()
+
         if name.endswith(".pdf"):
-            text_req += extract_pdf(temp_path)
+            full_requirements_text += extract_pdf(p)
         elif name.endswith(".docx"):
-            text_req += extract_docx(temp_path)
+            full_requirements_text += extract_docx(p)
         elif name.endswith(".edoc"):
-            text_req += extract_edoc(temp_path)
+            full_requirements_text += extract_edoc(p)
         elif name.endswith(".zip"):
-            text_req += extract_zip(temp_path)
+            full_requirements_text += extract_zip(p)
+        else:
+            raise HTTPException(400, f"Unsupported requirement file: {name}")
 
-        os.unlink(temp_path)
+        os.unlink(p)
 
-    req_json = ai_parse_requirements(text_req)
+    if not full_requirements_text.strip():
+        raise HTTPException(status_code=400, detail="No readable requirement text found.")
 
-    # Extract CANDIDATES
-    cand_results = []
+    req_structured = parse_requirements_ai(full_requirements_text)
+
+
+    # -------------------------
+    # CANDIDATES EXTRACTION
+    # -------------------------
+
+    candidate_results = []
 
     for f in candidates:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(await f.read())
-        temp_path = temp.name
-        temp.close()
 
-        name = f.filename.lower()
-        if not name.endswith(".zip"):
-            raise HTTPException(400, "Candidate must be ZIP")
-
-        text_cand = extract_zip(temp_path)
-        os.unlink(temp_path)
-
-        evaluation = ai_compare_candidate(req_json, text_cand)
-
-        cand_results.append({
-            "candidate": f.filename,
-            "evaluation": evaluation
-        })
-
-    return {
-        "status": "OK",
-        "requirements_parsed": req_json,
-        "candidates": cand_results
-    }
-
-
-
-# ======================================================
-#   Endpoint: PDF /compare_files_pdf
-# ======================================================
-
-@app.post("/compare_files_pdf")
-async def compare_files_pdf(
-    requirements: List[UploadFile] = File(...),
-    candidates: List[UploadFile] = File(...)
-):
-
-    # SAME LOGIC AS /compare_files
-    text_req = ""
-    for f in requirements:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(await f.read())
-        temp_path = temp.name
-        temp.close()
-
-        name = f.filename.lower()
-        if name.endswith(".pdf"):
-            text_req += extract_pdf(temp_path)
-        elif name.endswith(".docx"):
-            text_req += extract_docx(temp_path)
-        elif name.endswith(".edoc"):
-            text_req += extract_edoc(temp_path)
-        elif name.endswith(".zip"):
-            text_req += extract_zip(temp_path)
-
-        os.unlink(temp_path)
-
-    req_json = ai_parse_requirements(text_req)
-
-    cand_results = []
-
-    for f in candidates:
-        temp = tempfile.NamedTemporaryFile(delete=False)
-        temp.write(await f.read())
-        temp_path = temp.name
-        temp.close()
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(await f.read())
+            p = tmp.name
 
         if not f.filename.lower().endswith(".zip"):
-            raise HTTPException(400, "Candidate must be ZIP")
+            raise HTTPException(400, f"Candidate must be ZIP: {f.filename}")
 
-        text_cand = extract_zip(temp_path)
-        os.unlink(temp_path)
+        candidate_text = extract_zip(p)
+        os.unlink(p)
 
-        evaluation = ai_compare_candidate(req_json, text_cand)
+        if not candidate_text.strip():
+            candidate_results.append({
+                "candidate": f.filename,
+                "evaluation": "EMPTY FILE — RED"
+            })
+            continue
 
-        cand_results.append({
+        ai_eval = compare_candidate_ai(req_structured, candidate_text)
+
+        candidate_results.append({
             "candidate": f.filename,
-            "evaluation": evaluation
+            "evaluation": ai_eval
         })
 
-    # Generate PDF
-    pdf_path = generate_pdf(req_json, cand_results)
+    # -------------------------
+    # PDF GENERATION
+    # -------------------------
+
+    pdf_path = generate_pdf(req_structured, candidate_results)
 
     return FileResponse(
         pdf_path,
