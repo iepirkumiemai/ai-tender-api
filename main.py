@@ -11,137 +11,30 @@ import mammoth
 from pdfminer.high_level import extract_text
 from openai import OpenAI
 
-# OpenAI client
+# Init OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI-Tender-API", version="4.0")
+app = FastAPI(title="AI-Tender-API", version="5.0")
 
 
 # ============================================================
-# 1. EDOC extraction (ZIP + documents + XML)
+# 1. Split long text into chunks to avoid AI token limits
 # ============================================================
-def extract_edoc(path: str) -> Dict:
-    results = {
-        "documents": [],
-        "xml": [],
-        "raw_files": []
-    }
+def split_text_into_chunks(text: str, max_chars: int = 200000) -> list:
+    chunks = []
+    length = len(text)
 
-    with zipfile.ZipFile(path, 'r') as z:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            z.extractall(tmpdir)
+    if length <= max_chars:
+        return [text]
 
-            for root, dirs, files in os.walk(tmpdir):
-                for filename in files:
-                    full_path = os.path.join(root, filename)
-                    ext = filename.lower().split(".")[-1]
+    for i in range(0, length, max_chars):
+        chunks.append(text[i:i + max_chars])
 
-                    # XML
-                    if ext == "xml":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read()
-                        except:
-                            content = ""
-                        results["xml"].append({"filename": filename, "content": content})
-                        continue
-
-                    # TXT
-                    if ext == "txt":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    # DOCX
-                    if ext == "docx":
-                        try:
-                            with open(full_path, "rb") as f:
-                                extracted = mammoth.convert_to_markdown(f).value
-                        except:
-                            extracted = ""
-                        results["documents"].append({"filename": filename, "text": extracted})
-                        continue
-
-                    # PDF
-                    if ext == "pdf":
-                        try:
-                            text = extract_text(full_path)
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    # Everything else
-                    results["raw_files"].append({
-                        "filename": filename,
-                        "path": full_path
-                    })
-
-    return results
+    return chunks
 
 
 # ============================================================
-# 2. ZIP extraction (PDF / DOCX / TXT)
-# ============================================================
-def extract_zip(path: str) -> Dict:
-    results = {
-        "documents": [],
-        "raw_files": []
-    }
-
-    with zipfile.ZipFile(path, 'r') as z:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            z.extractall(tmpdir)
-
-            for root, dirs, files in os.walk(tmpdir):
-                for filename in files:
-                    full_path = os.path.join(root, filename)
-                    ext = filename.lower().split(".")[-1]
-
-                    # TXT
-                    if ext == "txt":
-                        try:
-                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                                text = f.read()
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    # DOCX
-                    if ext == "docx":
-                        try:
-                            with open(full_path, "rb") as f:
-                                extracted = mammoth.convert_to_markdown(f).value
-                        except:
-                            extracted = ""
-                        results["documents"].append({"filename": filename, "text": extracted})
-                        continue
-
-                    # PDF
-                    if ext == "pdf":
-                        try:
-                            text = extract_text(full_path)
-                        except:
-                            text = ""
-                        results["documents"].append({"filename": filename, "text": text})
-                        continue
-
-                    # Unknown
-                    results["raw_files"].append({
-                        "filename": filename,
-                        "path": full_path
-                    })
-
-    return results
-
-
-# ============================================================
-# 3. AI ANALYSIS (Stable OpenAI ChatCompletion format)
+# 2. AI single chunk analysis
 # ============================================================
 async def run_ai_analysis(text: str):
     if not text or text.strip() == "":
@@ -150,16 +43,16 @@ async def run_ai_analysis(text: str):
     prompt = f"""
 You are an AI Tender Evaluation Expert.
 
-DOCUMENT CONTENT:
+DOCUMENT CHUNK:
 {text}
 
 TASK:
-1. Provide a concise summary.
+1. Provide a concise summary of the chunk.
 2. Evaluate compliance level (0–100%).
-3. Identify non-compliant or missing elements.
-4. Provide practical improvement recommendations.
+3. Identify non-compliant or missing items.
+4. Provide practical recommendations.
 
-Return STRICT JSON:
+Respond with STRICT JSON ONLY:
 - summary
 - compliance_score
 - non_compliance_items
@@ -172,14 +65,58 @@ Return STRICT JSON:
     )
 
     ai_raw = response.choices[0].message.content
-
     clean = ai_raw.strip().replace("```json", "").replace("```", "").strip()
 
     return clean
 
 
 # ============================================================
-# 4. PDF extraction
+# 3. Analyze long text using chunks
+# ============================================================
+async def analyze_large_text(text: str):
+    chunks = split_text_into_chunks(text)
+    results = []
+
+    for idx, chunk in enumerate(chunks):
+        raw = await run_ai_analysis(chunk)
+
+        try:
+            json_data = json.loads(raw)
+        except:
+            json_data = {"summary": "", "compliance_score": 0,
+                         "non_compliance_items": [], "recommendations": []}
+
+        results.append(json_data)
+
+    # Combine all summaries
+    combined_summary = " ".join([r.get("summary", "") for r in results])
+
+    # Average compliance score
+    scores = [r.get("compliance_score", 0) for r in results]
+    avg_score = sum(scores) / len(scores) if scores else 0
+
+    # Merge non-compliance
+    non_comp = []
+    for r in results:
+        items = r.get("non_compliance_items", [])
+        non_comp.extend(items)
+
+    # Merge recommendations
+    recs = []
+    for r in results:
+        recs.extend(r.get("recommendations", []))
+
+    return {
+        "summary": combined_summary,
+        "compliance_score": avg_score,
+        "non_compliance_items": list(set(non_comp)),
+        "recommendations": list(set(recs)),
+        "chunks_analyzed": len(chunks)
+    }
+
+
+# ============================================================
+# 4. Extraction: PDF, DOCX, TXT
 # ============================================================
 def extract_pdf(path: str) -> str:
     try:
@@ -188,9 +125,6 @@ def extract_pdf(path: str) -> str:
         return ""
 
 
-# ============================================================
-# 5. DOCX extraction
-# ============================================================
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -200,35 +134,136 @@ def extract_docx(path: str) -> str:
 
 
 # ============================================================
-# 6. Universal file processor
+# 5. Extract EDOC (ZIP + XML)
 # ============================================================
-def process_file(file_path: str, ext: str) -> Dict:
+def extract_edoc(path: str) -> Dict:
+    results = {"documents": [], "xml": [], "raw_files": []}
+
+    with zipfile.ZipFile(path, 'r') as z:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            z.extractall(tmpdir)
+
+            for root, dirs, files in os.walk(tmpdir):
+                for filename in files:
+                    ext = filename.lower().split(".")[-1]
+                    full_path = os.path.join(root, filename)
+
+                    if ext == "xml":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                xml = f.read()
+                        except:
+                            xml = ""
+                        results["xml"].append({"filename": filename, "content": xml})
+                        continue
+
+                    if ext == "txt":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    if ext == "docx":
+                        try:
+                            with open(full_path, "rb") as f:
+                                text = mammoth.convert_to_markdown(f).value
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    if ext == "pdf":
+                        try:
+                            text = extract_text(full_path)
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    results["raw_files"].append({"filename": filename, "path": full_path})
+
+    return results
+
+
+# ============================================================
+# 6. Extract ZIP files (PDF / DOCX / TXT)
+# ============================================================
+def extract_zip(path: str) -> Dict:
+    results = {"documents": [], "raw_files": []}
+
+    with zipfile.ZipFile(path, 'r') as z:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            z.extractall(tmpdir)
+
+            for root, dirs, files in os.walk(tmpdir):
+                for filename in files:
+                    ext = filename.lower().split(".")[-1]
+                    full_path = os.path.join(root, filename)
+
+                    if ext == "txt":
+                        try:
+                            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                                text = f.read()
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    if ext == "docx":
+                        try:
+                            with open(full_path, "rb") as f:
+                                text = mammoth.convert_to_markdown(f).value
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    if ext == "pdf":
+                        try:
+                            text = extract_text(full_path)
+                        except:
+                            text = ""
+                        results["documents"].append({"filename": filename, "text": text})
+                        continue
+
+                    results["raw_files"].append({"filename": filename, "path": full_path})
+
+    return results
+
+
+# ============================================================
+# 7. Universal file processor
+# ============================================================
+def process_file(path: str, ext: str) -> Dict:
     ext = ext.lower()
 
     if ext == "pdf":
-        return {"type": "pdf", "text": extract_pdf(file_path)}
+        return {"type": "pdf", "text": extract_pdf(path)}
 
     if ext == "docx":
-        return {"type": "docx", "text": extract_docx(file_path)}
+        return {"type": "docx", "text": extract_docx(path)}
 
     if ext == "txt":
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return {"type": "txt", "text": f.read()}
         except:
             return {"type": "txt", "text": ""}
 
     if ext == "edoc":
-        return extract_edoc(file_path)
+        return extract_edoc(path)
 
     if ext == "zip":
-        return extract_zip(file_path)
+        return extract_zip(path)
 
     return {"type": "unknown", "text": ""}
 
 
 # ============================================================
-# 7. Health check
+# 8. Health check
 # ============================================================
 @app.get("/api/status")
 async def status():
@@ -236,45 +271,37 @@ async def status():
 
 
 # ============================================================
-# 8. AUTO-ANALYZE UPLOAD (file → extract → AI)
+# 9. Upload endpoint with AUTO-CHUNK ANALYSIS
 # ============================================================
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     filename = file.filename
     ext = filename.split(".")[-1].lower()
 
-    # Save temp file
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(await file.read())
-        tmp_path = tmp.name
+        path = tmp.name
 
-    # Extraction
-    extraction = process_file(tmp_path, ext)
+    extraction = process_file(path, ext)
 
-    # Determine text for AI
+    # Extract text depending on format
     if ext in ["pdf", "docx", "txt"]:
         text = extraction.get("text", "")
 
-    elif ext in ["edoc", "zip"]:
-        all_docs = extraction.get("documents", [])
-        text = "\n\n".join([d.get("text", "") for d in all_docs])
+    elif ext in ["zip", "edoc"]:
+        docs = extraction.get("documents", [])
+        text = "\n\n".join([d.get("text", "") for d in docs])
 
     else:
         text = ""
 
-    # AI analysis
-    ai_raw_json = await run_ai_analysis(text)
-
-    try:
-        ai_data = json.loads(ai_raw_json)
-    except:
-        ai_data = {"error": "AI returned non-JSON", "raw_output": ai_raw_json}
+    # AI chunk-based analysis
+    ai_data = await analyze_large_text(text)
 
     return JSONResponse({
         "status": "OK",
         "filename": filename,
         "file_type": ext,
-        "extracted_text": text,
         "ai_analysis": ai_data,
         "documents": extraction.get("documents"),
         "xml": extraction.get("xml") if ext == "edoc" else None,
