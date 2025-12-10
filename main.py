@@ -1,6 +1,6 @@
-# ============================================================
-# main.py — AI Tender Comparison Engine v2.0
-# ============================================================
+# ===============================================
+# main.py — Tender Comparison API v9.0
+# ===============================================
 
 import os
 import zipfile
@@ -14,29 +14,26 @@ import mammoth
 from pdfminer.high_level import extract_text
 from openai import OpenAI
 
-# ------------------------------------------------------------
-# OpenAI klienta inicializācija
-# ------------------------------------------------------------
-
+# -----------------------------------------------
+# OPENAI CLIENT
+# -----------------------------------------------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(
     title="AI Tender Comparison Engine",
-    version="2.0",
-    description="Uploads multiple requirement files + candidate ZIP archives, extracts text and performs AI comparison using GPT-4.1."
+    version="9.0",
+    description="Uploads multiple requirement files + multiple candidate ZIPs and compares them using GPT-4.1"
 )
 
-# ============================================================
-# HELPERS — Teksta attīrīšana
-# ============================================================
-
+# ======================================================
+#   CLEAN TEXT
+# ======================================================
 def clean(text: str) -> str:
     return text.replace("\x00", "").strip()
 
-
-# ============================================================
-# FAILU EKSTRAKTORI
-# ============================================================
+# ======================================================
+#   FILE EXTRACTION HELPERS
+# ======================================================
 
 def extract_pdf(path: str) -> str:
     try:
@@ -44,15 +41,13 @@ def extract_pdf(path: str) -> str:
     except:
         return ""
 
-
 def extract_docx(path: str) -> str:
     try:
         with open(path, "rb") as f:
-            result = mammoth.extract_raw_text(f)
-            return clean(result.value)
+            result = mammoth.extract_raw_text(f).value
+            return clean(result)
     except:
         return ""
-
 
 def extract_edoc(path: str) -> str:
     text = ""
@@ -65,74 +60,73 @@ def extract_edoc(path: str) -> str:
         pass
     return text
 
-
 def extract_zip(path: str) -> str:
     combined = ""
-
     with zipfile.ZipFile(path, "r") as z:
         for name in z.namelist():
 
             if name.endswith("/"):
                 continue
 
+            # Write internal file temporarily
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(z.read(name))
                 tmp_path = tmp.name
 
-            if name.lower().endswith(".pdf"):
+            # Detect file type
+            lname = name.lower()
+            if lname.endswith(".pdf"):
                 combined += extract_pdf(tmp_path)
-
-            elif name.lower().endswith(".docx"):
+            elif lname.endswith(".docx"):
                 combined += extract_docx(tmp_path)
-
-            elif name.lower().endswith(".edoc"):
+            elif lname.endswith(".edoc"):
                 combined += extract_edoc(tmp_path)
-
-            elif name.lower().endswith(".zip"):
+            elif lname.endswith(".zip"):
                 combined += extract_zip(tmp_path)
 
             os.unlink(tmp_path)
 
     return combined
 
+# ======================================================
+#   AI — REQUIREMENT PARSER
+# ======================================================
 
-# ============================================================
-# AI FUNKCIJAS — GPT-4.1 analīze
-# ============================================================
+def parse_requirements_ai(text: str) -> str:
 
-def ai_parse_requirements(text: str) -> dict:
-    """Analizē prasību dokumentus un sadala kategorijās."""
     prompt = f"""
-Extract and structure the tender REQUIREMENT DOCUMENTS.
+You will extract and structure the following requirement documents.
 
-Return JSON exactly in this structure:
+Return STRICT JSON:
 
 {{
-  "requirements": [...], 
-  "mandatory_requirements": [...],
-  "technical_requirements": [...],
-  "risk_flags": [...],
-  "summary": "..."
+  "requirements": [...],
+  "summary": "...",
+  "key_points": [...],
+  "risks": [...]
 }}
 
---- REQUIREMENT DOCUMENT TEXT (FULL) ---
+Document text:
 {text}
 """
 
-    response = client.responses.create(
+    r = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
 
-    return response.output_text
+    return r.output_text
 
+# ======================================================
+#   AI — CANDIDATE COMPARISON (GREEN/YELLOW/RED)
+# ======================================================
 
-def ai_compare_candidate(requirements_json: str, candidate_text: str) -> dict:
-    """AI salīdzina kandidātu ar prasību dokumentiem."""
+def ai_compare_engine(requirements_json: str, candidate_text: str) -> str:
+
     prompt = f"""
-Compare the CANDIDATE DOCUMENT with the REQUIREMENTS.
+Compare REQUIREMENTS with CANDIDATE DOCUMENT.
 
-Return JSON in this exact structure:
+Return STRICT JSON:
 
 {{
   "match_score": 0-100,
@@ -143,24 +137,33 @@ Return JSON in this exact structure:
   "summary": "..."
 }}
 
---- STRUCTURED REQUIREMENTS JSON ---
+STATUS RULES:
+- match_score >= 90 → "GREEN"
+- 60 ≤ match_score < 90 → "YELLOW"
+- match_score < 60 → "RED"
+
+=====================
+REQUIREMENTS JSON:
+=====================
 {requirements_json}
 
---- CANDIDATE DOCUMENT ---
+=====================
+CANDIDATE DOCUMENT:
+=====================
 {candidate_text}
 """
 
-    response = client.responses.create(
+    r = client.responses.create(
         model="gpt-4.1",
         input=prompt
     )
 
-    return response.output_text
+    return r.output_text
 
 
-# ============================================================
-# GALVENĀ API METODE — /compare_files
-# ============================================================
+# ======================================================
+#   MAIN ENDPOINT — /compare_files
+# ======================================================
 
 @app.post("/compare_files")
 async def compare_files(
@@ -168,44 +171,41 @@ async def compare_files(
     candidates: List[UploadFile] = File(...)
 ):
 
-    # ======================================================
-    # 1) REQUIREMENT DOKUMENTU EKSTRAKCIJA
-    # ======================================================
-
-    req_text = ""
+    # --------------------------------------------------
+    # 1) Extract requirement documents
+    # --------------------------------------------------
+    full_req_text = ""
 
     for f in requirements:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
 
-        name = f.filename.lower()
+        fname = f.filename.lower()
 
-        if name.endswith(".pdf"):
-            req_text += extract_pdf(p)
-        elif name.endswith(".docx"):
-            req_text += extract_docx(p)
-        elif name.endswith(".edoc"):
-            req_text += extract_edoc(p)
-        elif name.endswith(".zip"):
-            req_text += extract_zip(p)
+        if fname.endswith(".pdf"):
+            full_req_text += extract_pdf(p)
+        elif fname.endswith(".docx"):
+            full_req_text += extract_docx(p)
+        elif fname.endswith(".edoc"):
+            full_req_text += extract_edoc(p)
+        elif fname.endswith(".zip"):
+            full_req_text += extract_zip(p)
         else:
-            raise HTTPException(400, f"Unsupported requirement file type: {name}")
+            raise HTTPException(400, f"Unsupported requirement file: {fname}")
 
         os.unlink(p)
 
-    if not req_text.strip():
-        raise HTTPException(400, "Requirement documents contain no readable text.")
+    if not full_req_text.strip():
+        return {"error": "No readable text extracted from requirements."}
 
-    # AI struktūrizē prasības
-    structured_requirements = ai_parse_requirements(req_text)
+    # Run GPT-4.1 requirement parser
+    requirements_structured = parse_requirements_ai(full_req_text)
 
-
-    # ======================================================
-    # 2) KANDIDĀTU ZIP EKSTRAKCIJA UN AI SALĪDZINĀŠANA
-    # ======================================================
-
-    candidate_results = []
+    # --------------------------------------------------
+    # 2) Extract candidates
+    # --------------------------------------------------
+    results = []
 
     for f in candidates:
 
@@ -213,35 +213,35 @@ async def compare_files(
             tmp.write(await f.read())
             p = tmp.name
 
-        if not f.filename.lower().endswith(".zip"):
-            raise HTTPException(400, f"Candidate must be ZIP: {f.filename}")
+        fname = f.filename.lower()
 
-        cand_text = extract_zip(p)
+        if not fname.endswith(".zip"):
+            raise HTTPException(400, f"Candidate must be ZIP: " + fname)
+
+        candidate_text = extract_zip(p)
         os.unlink(p)
 
-        if not cand_text.strip():
-            candidate_results.append({
+        if not candidate_text.strip():
+            results.append({
                 "candidate": f.filename,
                 "status": "RED",
-                "reason": "Unreadable or empty candidate archive."
+                "reason": "Candidate ZIP contained no readable text."
             })
             continue
 
-        # AI salīdzina prasības ar kandidātu
-        evaluation = ai_compare_candidate(structured_requirements, cand_text)
+        # Run GPT-4.1 comparison engine
+        evaluation = ai_compare_engine(requirements_structured, candidate_text)
 
-        candidate_results.append({
+        results.append({
             "candidate": f.filename,
             "evaluation": evaluation
         })
 
-
-    # ======================================================
-    # 3) FINĀLAIS JSON REZULTĀTS
-    # ======================================================
-
+    # --------------------------------------------------
+    # 3) Final response
+    # --------------------------------------------------
     return {
         "status": "OK",
-        "requirements_parsed": structured_requirements,
-        "candidates": candidate_results
+        "requirements_parsed": requirements_structured,
+        "candidates": results
     }
