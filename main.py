@@ -2,7 +2,6 @@ import os
 import zipfile
 import tempfile
 from pathlib import Path
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,8 +9,8 @@ from fastapi.responses import JSONResponse
 import openai
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-import mammoth
 from pdfminer.high_level import extract_text
+from docx import Document
 
 
 # ===========================
@@ -35,9 +34,9 @@ def extract_pdf(path: str) -> str:
 
 def extract_docx(path: str) -> str:
     try:
-        with open(path, "rb") as f:
-            result = mammoth.extract_raw_text(f)
-            return clean(result.value)
+        doc = Document(path)
+        full = "\n".join([p.text for p in doc.paragraphs])
+        return clean(full)
     except:
         return ""
 
@@ -70,6 +69,7 @@ def extract_zip(path: str) -> str:
     try:
         with zipfile.ZipFile(path, "r") as z:
             for name in z.namelist():
+
                 if name.endswith("/"):
                     continue
 
@@ -87,6 +87,8 @@ def extract_zip(path: str) -> str:
                     combined += extract_txt(inner)
                 elif name_low.endswith(".edoc"):
                     combined += extract_edoc(inner)
+                elif name_low.endswith(".zip"):
+                    combined += extract_zip(inner)
 
                 os.unlink(inner)
     except:
@@ -117,7 +119,7 @@ def extract_any(path: str, filename: str) -> str:
 # ===========================
 def gpt_structure_requirements(text: str):
     prompt = f"""
-You are a tender analyzer. Read the requirements and return STRICT JSON:
+Extract requirements and return STRICT JSON:
 
 {{
   "requirements_list": [...],
@@ -126,7 +128,7 @@ You are a tender analyzer. Read the requirements and return STRICT JSON:
   "summary": "..."
 }}
 
-REQUIREMENT TEXT:
+REQUIREMENTS DOCUMENT:
 {text}
 """
 
@@ -173,7 +175,7 @@ CANDIDATE:
 # ===========================
 # FASTAPI APP
 # ===========================
-app = FastAPI(title="AI Tender Engine", version="9.1")
+app = FastAPI(title="AI Tender Engine", version="10.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,7 +187,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "9.1"}
+    return {"status": "ok", "engine": "10.0"}
 
 
 # ===========================
@@ -196,7 +198,7 @@ async def compare_files(
     requirements: UploadFile = File(...),
     candidates: UploadFile = File(...)
 ):
-    # Requirements
+    # REQUIREMENTS
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(await requirements.read())
         req_path = tmp.name
@@ -209,7 +211,7 @@ async def compare_files(
 
     structured = gpt_structure_requirements(req_text)
 
-    # Candidate ZIP
+    # CANDIDATE ZIP
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp.write(await candidates.read())
         cand_path = tmp.name
