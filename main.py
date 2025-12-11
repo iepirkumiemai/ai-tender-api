@@ -1,50 +1,57 @@
+# ======================================================
+# main.py — AI Tender Analyzer (GPT-4o Stable Version)
+# ======================================================
+
 import os
 import zipfile
 import tempfile
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
-import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
+from openai import OpenAI
+import mammoth
+from PyPDF2 import PdfReader
 
-from pdfminer.high_level import extract_text
-from docx import Document
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+app = FastAPI(
+    title="AI Tender Engine",
+    version="1.0",
+    description="Tender requirement vs candidate ZIP comparison using GPT-4o"
+)
 
-# ===========================
-# TEXT CLEANER
-# ===========================
-def clean(t: str) -> str:
-    if not t:
+# ======================================================
+#   TEXT UTIL
+# ======================================================
+
+def clean(text: str) -> str:
+    if not text:
         return ""
-    return t.replace("\x00", "").strip()
+    return text.replace("\x00", "").strip()
 
 
-# ===========================
-# FILE EXTRACTORS
-# ===========================
+# ======================================================
+#   FILE EXTRACTORS
+# ======================================================
+
 def extract_pdf(path: str) -> str:
     try:
-        return clean(extract_text(path))
+        reader = PdfReader(path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return clean(text)
     except:
         return ""
 
 
 def extract_docx(path: str) -> str:
     try:
-        doc = Document(path)
-        full = "\n".join([p.text for p in doc.paragraphs])
-        return clean(full)
-    except:
-        return ""
-
-
-def extract_txt(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return clean(f.read())
+        with open(path, "rb") as f:
+            result = mammoth.extract_raw_text(f)
+            return clean(result.value)
     except:
         return ""
 
@@ -54,11 +61,9 @@ def extract_edoc(path: str) -> str:
     try:
         with zipfile.ZipFile(path, "r") as z:
             for name in z.namelist():
-                if name.lower().endswith(".txt") or name.lower().endswith(".xml"):
-                    try:
-                        text += clean(z.read(name).decode(errors="ignore"))
-                    except:
-                        pass
+                if name.endswith(".xml") or name.endswith(".txt"):
+                    data = z.read(name).decode("utf-8", errors="ignore")
+                    text += clean(data)
     except:
         pass
     return text
@@ -66,166 +71,179 @@ def extract_edoc(path: str) -> str:
 
 def extract_zip(path: str) -> str:
     combined = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
 
-                if name.endswith("/"):
-                    continue
+    with zipfile.ZipFile(path, "r") as z:
+        for name in z.namelist():
 
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    tmp.write(z.read(name))
-                    inner = tmp.name
+            if name.endswith("/"):
+                continue
 
-                name_low = name.lower()
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(z.read(name))
+                tmp_path = tmp.name
 
-                if name_low.endswith(".pdf"):
-                    combined += extract_pdf(inner)
-                elif name_low.endswith(".docx"):
-                    combined += extract_docx(inner)
-                elif name_low.endswith(".txt"):
-                    combined += extract_txt(inner)
-                elif name_low.endswith(".edoc"):
-                    combined += extract_edoc(inner)
-                elif name_low.endswith(".zip"):
-                    combined += extract_zip(inner)
+            lower = name.lower()
 
-                os.unlink(inner)
-    except:
-        pass
+            if lower.endswith(".pdf"):
+                combined += extract_pdf(tmp_path)
+
+            elif lower.endswith(".docx"):
+                combined += extract_docx(tmp_path)
+
+            elif lower.endswith(".edoc"):
+                combined += extract_edoc(tmp_path)
+
+            elif lower.endswith(".zip"):
+                combined += extract_zip(tmp_path)
+
+            os.unlink(tmp_path)
 
     return combined
 
 
-def extract_any(path: str, filename: str) -> str:
-    name = filename.lower()
+# ======================================================
+#   GPT-4o REQUIREMENT PARSING
+# ======================================================
 
-    if name.endswith(".pdf"):
-        return extract_pdf(path)
-    if name.endswith(".docx"):
-        return extract_docx(path)
-    if name.endswith(".txt"):
-        return extract_txt(path)
-    if name.endswith(".edoc"):
-        return extract_edoc(path)
-    if name.endswith(".zip"):
-        return extract_zip(path)
-
-    return ""
-
-
-# ===========================
-# GPT FUNCTIONS
-# ===========================
-def gpt_structure_requirements(text: str):
+def ai_parse_requirements(text: str) -> dict:
     prompt = f"""
-Extract requirements and return STRICT JSON:
+Extract and structure the tender REQUIREMENTS from this document.
+
+Return JSON ONLY with this structure:
 
 {{
-  "requirements_list": [...],
+  "requirements": [...],
+  "summary": "...",
   "key_points": [...],
-  "risks": [...],
-  "summary": "..."
+  "risks": [...]
 }}
 
-REQUIREMENTS DOCUMENT:
+Document:
 {text}
 """
 
-    try:
-        response = openai.responses.create(
-            model="gpt-4.1-turbo",
-            input=[{"role": "user", "content": prompt}]
-        )
-        return response.output_text
-    except Exception as e:
-        return {"error": str(e)}
+    response = client.responses.create(
+        model="gpt-4o",
+        input=prompt
+    )
+
+    return response.output_text
 
 
-def gpt_compare_candidate(requirements_json: str, candidate_text: str):
+# ======================================================
+#   GPT-4o CANDIDATE EVALUATION
+# ======================================================
+
+def ai_compare(requirements: str, candidate: str) -> dict:
     prompt = f"""
-Compare REQUIREMENTS and CANDIDATE. Return STRICT JSON:
+Compare the CANDIDATE DOCUMENT with the REQUIREMENTS.
+
+Return JSON ONLY:
 
 {{
   "match_score": 0-100,
   "status": "GREEN | YELLOW | RED",
-  "met": [...],
-  "missing": [...],
+  "matched_requirements": [...],
+  "missing_requirements": [...],
   "risks": [...],
   "summary": "..."
 }}
 
 REQUIREMENTS:
-{requirements_json}
+{requirements}
 
 CANDIDATE:
-{candidate_text}
+{candidate}
 """
 
-    try:
-        response = openai.responses.create(
-            model="gpt-4.1-turbo",
-            input=[{"role": "user", "content": prompt}]
-        )
-        return response.output_text
-    except Exception as e:
-        return {"error": str(e)}
+    response = client.responses.create(
+        model="gpt-4o",
+        input=prompt
+    )
+
+    return response.output_text
 
 
-# ===========================
-# FASTAPI APP
-# ===========================
-app = FastAPI(title="AI Tender Engine", version="10.0")
+# ======================================================
+#   MAIN ENDPOINT — /compare_files
+# ======================================================
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "engine": "10.0"}
-
-
-# ===========================
-# MAIN ENDPOINT
-# ===========================
 @app.post("/compare_files")
 async def compare_files(
-    requirements: UploadFile = File(...),
-    candidates: UploadFile = File(...)
+    requirements: List[UploadFile] = File(...),
+    candidates: List[UploadFile] = File(...)
 ):
-    # REQUIREMENTS
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(await requirements.read())
-        req_path = tmp.name
 
-    req_text = extract_any(req_path, requirements.filename)
-    os.unlink(req_path)
+    # ------------------------------------
+    # 1) Extract REQUIREMENT documents
+    # ------------------------------------
 
-    if not req_text:
-        raise HTTPException(400, "Requirements unreadable")
+    req_text = ""
 
-    structured = gpt_structure_requirements(req_text)
+    for f in requirements:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(await f.read())
+            p = tmp.name
 
-    # CANDIDATE ZIP
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(await candidates.read())
-        cand_path = tmp.name
+        fn = f.filename.lower()
 
-    cand_text = extract_any(cand_path, candidates.filename)
-    os.unlink(cand_path)
+        if fn.endswith(".pdf"):
+            req_text += extract_pdf(p)
+        elif fn.endswith(".docx"):
+            req_text += extract_docx(p)
+        elif fn.endswith(".edoc"):
+            req_text += extract_edoc(p)
+        elif fn.endswith(".zip"):
+            req_text += extract_zip(p)
+        else:
+            raise HTTPException(400, f"Unsupported requirement file: {fn}")
 
-    if not cand_text:
-        raise HTTPException(400, "Candidate unreadable")
+        os.unlink(p)
 
-    comparison = gpt_compare_candidate(structured, cand_text)
+    if not req_text.strip():
+        return {"error": "No readable text found in requirement files."}
+
+    requirements_json = ai_parse_requirements(req_text)
+
+    # ------------------------------------
+    # 2) Extract CANDIDATE ZIP files
+    # ------------------------------------
+
+    results = []
+
+    for f in candidates:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(await f.read())
+            p = tmp.name
+
+        fn = f.filename.lower()
+
+        if not fn.endswith(".zip"):
+            raise HTTPException(400, f"Candidate must be a ZIP archive: {fn}")
+
+        cand_text = extract_zip(p)
+        os.unlink(p)
+
+        if not cand_text.strip():
+            results.append({
+                "candidate": f.filename,
+                "error": "Empty or unreadable candidate ZIP"
+            })
+            continue
+
+        analysis_json = ai_compare(requirements_json, cand_text)
+
+        results.append({
+            "candidate": f.filename,
+            "analysis": analysis_json
+        })
+
+    # ------------------------------------
+    # 3) Return final JSON
+    # ------------------------------------
 
     return {
         "status": "ok",
-        "requirements_structured": structured,
-        "candidate_analysis": comparison
+        "requirements_structured": requirements_json,
+        "candidate_analysis": results
     }
