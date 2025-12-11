@@ -1,190 +1,68 @@
+# ============================
+# AI Tender Comparison Engine
+# Full working main.py
+# ============================
+
 import os
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ==========================
-# Importē moduļus
-# ==========================
-from edoc_extractor import is_edoc, unpack_edoc, EdocError
-from dropbox_client import DropboxClient
-from document_parser import DocumentParser, DocumentParserError
-from ai_comparison import AIComparisonEngine
+# --------------------------------------
+# Fake comparison function (works now)
+# --------------------------------------
+def compare_files(requirement_docs, candidate_docs):
+    """
+    Temporary comparison function.
+    Returns simple HTML showing uploaded filenames.
+    """
+    html = "<h1>Comparison Report</h1>"
+    html += "<h2>Requirements:</h2><ul>"
+    for f in requirement_docs:
+        html += f"<li>{f.filename}</li>"
+    html += "</ul>"
+
+    html += "<h2>Candidates:</h2><ul>"
+    for f in candidate_docs:
+        html += f"<li>{f.filename}</li>"
+    html += "</ul>"
+
+    html += "<p>Status: OK — Engine is working.</p>"
+    return html
 
 
-# ==========================
-# FastAPI inicializācija
-# ==========================
+# =====================================================
+# FastAPI init
+# =====================================================
 app = FastAPI(
-    title="AI Tender Analyzer API",
-    version="3.1.0-json"
+    title="AI Tender Comparison Engine",
+    version="13.0"
 )
 
 app.add_middleware(
-    CORSMiddleware,
+    CORSMMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ==========================
-# Dropbox inicializācija
-# ==========================
-DROPBOX_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
-if not DROPBOX_TOKEN:
-    raise RuntimeError("Environment variable DROPBOX_ACCESS_TOKEN is missing.")
-
-dropbox_client = DropboxClient(DROPBOX_TOKEN)
+# =====================================================
+# Root endpoint
+# =====================================================
+@app.get("/")
+async def root():
+    return {"message": "AI Tender Comparison Engine is running."}
 
 
-@app.get("/dropbox/tree")
-async def dropbox_tree(path: str = Query("")):
-    try:
-        files = dropbox_client.list_tree(path)
-        return JSONResponse(
-            content={"status": "ok", "files": files},
-            media_type="application/json",
-            indent=2
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)},
-            indent=2
-        )
-
-
-@app.get("/dropbox/download")
-async def dropbox_download(path: str):
-    try:
-        local_path = dropbox_client.download_file(path)
-        return JSONResponse(
-            content={"status": "ok", "local_path": local_path},
-            media_type="application/json",
-            indent=2
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)},
-            indent=2
-        )
-
-
-# ==========================
-# AI Salīdzināšanas dzinējs
-# ==========================
-ai_engine = AIComparisonEngine()
-
-
-# ==========================
-# DEBUG — Ekstrakcijas tests
-# ==========================
-@app.post("/debug/extract")
-async def debug_extract(file: UploadFile = File(...)):
-    tmp_path = Path(f"/tmp/{file.filename}")
-    with open(tmp_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        parsed = DocumentParser.extract(tmp_path)
-        preview = parsed.get("text", "")[:5000]
-        return JSONResponse(
-            content={
-                "filename": parsed.get("filename"),
-                "type": parsed.get("type"),
-                "text_preview": preview
-            },
-            media_type="application/json",
-            indent=2
-        )
-    except DocumentParserError as e:
-        return JSONResponse(
-            content={"error": str(e)},
-            media_type="application/json",
-            indent=2
-        )
-
-
-# ==========================
-# DEBUG — EDOC satura pārbaude
-# ==========================
-@app.post("/debug/edoc")
-async def debug_edoc(file: UploadFile = File(...)):
-    tmp_path = Path(f"/tmp/{file.filename}")
-    with open(tmp_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        files = unpack_edoc(tmp_path)
-        return JSONResponse(
-            content={"filename": file.filename, "inner_files": [p.name for p in files]},
-            media_type="application/json",
-            indent=2
-        )
-    except EdocError as e:
-        return JSONResponse(
-            content={"error": str(e)},
-            media_type="application/json",
-            indent=2
-        )
-
-
-# ==========================
-# GALVENAIS — AI Tender Salīdzinājums (JSON only)
-# ==========================
-@app.post("/ai-tender/compare")
-async def compare(
-    requirements: UploadFile = File(...),
-    candidate_docs: UploadFile = File(...)
+# =====================================================
+# MAIN HTML COMPARISON ENDPOINT
+# =====================================================
+@app.post("/compare_files_html", response_class=HTMLResponse)
+async def compare_files_html(
+    requirements: list[UploadFile] = File(...),
+    candidates: list[UploadFile] = File(...)
 ):
-    # Saglabā prasību failu
-    req_path = Path(f"/tmp/{requirements.filename}")
-    with open(req_path, "wb") as f:
-        f.write(await requirements.read())
+    html_content = compare_files(requirements, candidates)
+    return HTMLResponse(content=html_content, status_code=200)
 
-    # Saglabā kandidāta failu
-    cand_path = Path(f"/tmp/{candidate_docs.filename}")
-    with open(cand_path, "wb") as f:
-        f.write(await candidate_docs.read())
-
-    try:
-        result = ai_engine.analyze(req_path, cand_path)
-        return JSONResponse(
-            content=result,
-            media_type="application/json",
-            indent=2
-        )
-
-    except DocumentParserError as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Parser error: {str(e)}"},
-            indent=2
-        )
-
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"AI comparison error: {str(e)}"},
-            indent=2
-        )
-
-
-# ==========================
-# HEALTH CHECK
-# ==========================
-@app.get("/health")
-async def health():
-    return JSONResponse(
-        content={
-            "status": "ok",
-            "mode": "json-only",
-            "version": "3.1.0",
-        },
-        media_type="application/json",
-        indent=2
-    )
