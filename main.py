@@ -3,28 +3,17 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# =========================
-# Minimalais AI Engine Mock
-# (šeit tu vari likt īsto loģiku,
-#  bet API nesabruks pat tukšā formā)
-# =========================
-def run_ai_analysis(req_path: Path, cand_path: Path):
-    return {
-        "status": "ok",
-        "requirements_file": req_path.name,
-        "candidate_file": cand_path.name,
-        "analysis": "AI analysis placeholder — system stable and running."
-    }
+# ==========================================================
+# STABILAIS A VARIANTS — BEZ AI, BEZ PARSERIEM, TIKAI JSON
+# ==========================================================
 
-# =========================
-# FastAPI inicializācija
-# =========================
 app = FastAPI(
     title="AI Tender Analyzer — JSON Stable",
-    version="0.1.0"
+    version="0.1.0",
+    description="Stabils JSON-only API karkass bez analīzes. Nekas nevar salūzt."
 )
 
-# CORS priekš WordPress / Frontend
+# CORS (WordPress / Frontend drošai piekļuvei)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,21 +22,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# Health check
-# =========================
+# ==========================================================
+# HEALTH CHECK
+# ==========================================================
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.1.0", "mode": "json-only"}
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "mode": "json-only",
+        "message": "Serveris darbojas stabili."
+    }
 
-# =========================
-# Galvenais JSON salīdzināšanas endpoints
-# =========================
+# ==========================================================
+# GALVENAIS — JSON-ONLY FAILU IESNIEGŠANAS ENDPOINT
+# ==========================================================
 @app.post("/ai-tender/compare")
 async def compare_files(
     requirements: UploadFile = File(...),
     candidate_docs: UploadFile = File(...)
 ):
+    """
+    A variants:
+    - Saglabā abus failus
+    - NEVEIC nekādu dokumentu analīzi
+    - Atgriež JSON ar failu nosaukumiem
+    """
+
     # Saglabā prasību failu
     req_path = Path(f"/tmp/{requirements.filename}")
     with open(req_path, "wb") as f:
@@ -58,7 +59,14 @@ async def compare_files(
     with open(cand_path, "wb") as f:
         f.write(await candidate_docs.read())
 
-    # Izsauc stabilo AI loģiku
-    result = run_ai_analysis(req_path, cand_path)
-
-    return JSONResponse(content=result, indent=2)
+    # Atgriež stabilu JSON atbildi
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "requirements_file": req_path.name,
+            "candidate_file": cand_path.name,
+            "analysis": "A-variants darbojas. API saņem failus un atbild JSON formātā.",
+            "note": "Šī nav reāla analīze – tā tiks pievienota B variantā."
+        },
+        indent=2
+    )
