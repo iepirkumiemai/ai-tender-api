@@ -1,23 +1,30 @@
-import os
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ==========================
-# Importē moduļus (tie paši, kas strādāja toreiz)
-# ==========================
-from document_parser import DocumentParser, DocumentParserError
-from ai_comparison import AIComparisonEngine
+# =========================
+# Minimalais AI Engine Mock
+# (šeit tu vari likt īsto loģiku,
+#  bet API nesabruks pat tukšā formā)
+# =========================
+def run_ai_analysis(req_path: Path, cand_path: Path):
+    return {
+        "status": "ok",
+        "requirements_file": req_path.name,
+        "candidate_file": cand_path.name,
+        "analysis": "AI analysis placeholder — system stable and running."
+    }
 
-# ==========================
+# =========================
 # FastAPI inicializācija
-# ==========================
+# =========================
 app = FastAPI(
-    title="AI Tender Analyzer API",
-    version="0.9.0-json-stable"
+    title="AI Tender Analyzer — JSON Stable",
+    version="0.1.0"
 )
 
+# CORS priekš WordPress / Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,40 +33,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================
-# AI comparison engine
-# ==========================
-ai_engine = AIComparisonEngine()
+# =========================
+# Health check
+# =========================
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "0.1.0", "mode": "json-only"}
 
-
-# ==========================
-# DEBUG – vienkārša ekstrakcija
-# ==========================
-@app.post("/debug/extract")
-async def debug_extract(file: UploadFile = File(...)):
-    tmp_path = Path(f"/tmp/{file.filename}")
-    with open(tmp_path, "wb") as f:
-        f.write(await file.read())
-
-    try:
-        data = DocumentParser.extract(tmp_path)
-        return JSONResponse(
-            {
-                "filename": data["filename"],
-                "type": data["type"],
-                "text_preview": data["text"][:2000]
-            },
-            indent=2
-        )
-    except DocumentParserError as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# ==========================
-# GALVENĀ FUNCTION – JSON AI SALĪDZINĀŠANA
-# ==========================
+# =========================
+# Galvenais JSON salīdzināšanas endpoints
+# =========================
 @app.post("/ai-tender/compare")
-async def compare(
+async def compare_files(
     requirements: UploadFile = File(...),
     candidate_docs: UploadFile = File(...)
 ):
@@ -73,20 +58,7 @@ async def compare(
     with open(cand_path, "wb") as f:
         f.write(await candidate_docs.read())
 
-    # Izpilda AI salīdzināšanu
-    try:
-        result = ai_engine.analyze(req_path, cand_path)
-        return JSONResponse(result, indent=2)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    # Izsauc stabilo AI loģiku
+    result = run_ai_analysis(req_path, cand_path)
 
-
-# ==========================
-# HEALTH CHECK
-# ==========================
-@app.get("/health")
-async def health():
-    return JSONResponse(
-        {"status": "ok", "version": "0.9.0-json-stable"},
-        indent=2
-    )
+    return JSONResponse(content=result, indent=2)
