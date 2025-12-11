@@ -1,47 +1,53 @@
-# ======================================================
-# main.py — AI Tender Analyzer (GPT-4o Stable Version)
-# ======================================================
+# ===============================================
+# main.py — Tender Comparison API (A-Variant Safe Mode)
+# ===============================================
 
 import os
 import zipfile
 import tempfile
-from typing import List
-
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-
+from typing import List
 from openai import OpenAI
+import PyPDF2
 import mammoth
-from PyPDF2 import PdfReader
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(
-    title="AI Tender Engine",
+    title="AI Tender Comparison Engine — A Variant",
     version="1.0",
-    description="Tender requirement vs candidate ZIP comparison using GPT-4o"
+    description="Safe mode: text trimming to avoid context overflow."
 )
 
 # ======================================================
-#   TEXT UTIL
+#   TEKSTA TĪRĪTĀJS
 # ======================================================
 
 def clean(text: str) -> str:
-    if not text:
-        return ""
     return text.replace("\x00", "").strip()
 
+# Limita izmērs (A-variantam pietiek)
+MAX_TEXT = 30000
+
+
+def trim(text: str) -> str:
+    """Apgriež tekstu līdz 30 000 simboliem, lai nepieļautu GPT konteksta pārsniegšanu."""
+    if len(text) > MAX_TEXT:
+        return text[:MAX_TEXT]
+    return text
 
 # ======================================================
-#   FILE EXTRACTORS
+#   FAILU EKSTRAKTORI
 # ======================================================
 
 def extract_pdf(path: str) -> str:
     try:
-        reader = PdfReader(path)
         text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
+        with open(path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() or ""
         return clean(text)
     except:
         return ""
@@ -56,69 +62,46 @@ def extract_docx(path: str) -> str:
         return ""
 
 
-def extract_edoc(path: str) -> str:
-    text = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if name.endswith(".xml") or name.endswith(".txt"):
-                    data = z.read(name).decode("utf-8", errors="ignore")
-                    text += clean(data)
-    except:
-        pass
-    return text
-
-
 def extract_zip(path: str) -> str:
     combined = ""
-
     with zipfile.ZipFile(path, "r") as z:
         for name in z.namelist():
 
             if name.endswith("/"):
                 continue
 
+            # izvelkam failu
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(z.read(name))
                 tmp_path = tmp.name
 
-            lower = name.lower()
-
-            if lower.endswith(".pdf"):
+            if name.lower().endswith(".pdf"):
                 combined += extract_pdf(tmp_path)
 
-            elif lower.endswith(".docx"):
+            elif name.lower().endswith(".docx"):
                 combined += extract_docx(tmp_path)
-
-            elif lower.endswith(".edoc"):
-                combined += extract_edoc(tmp_path)
-
-            elif lower.endswith(".zip"):
-                combined += extract_zip(tmp_path)
 
             os.unlink(tmp_path)
 
     return combined
 
-
 # ======================================================
-#   GPT-4o REQUIREMENT PARSING
+#   AI FUNKCIJAS (AR TRIMMING)
 # ======================================================
 
-def ai_parse_requirements(text: str) -> dict:
+def ai_parse_requirements(text: str) -> str:
+
+    text = trim(text)
+
     prompt = f"""
-Extract and structure the tender REQUIREMENTS from this document.
-
-Return JSON ONLY with this structure:
-
+Extract key requirements from this document and return JSON:
 {{
-  "requirements": [...],
   "summary": "...",
+  "requirements": [...],
   "key_points": [...],
   "risks": [...]
 }}
-
-Document:
+TEXT:
 {text}
 """
 
@@ -130,16 +113,14 @@ Document:
     return response.output_text
 
 
-# ======================================================
-#   GPT-4o CANDIDATE EVALUATION
-# ======================================================
+def ai_compare(requirements: str, candidate: str) -> str:
 
-def ai_compare(requirements: str, candidate: str) -> dict:
+    requirements = trim(requirements)
+    candidate = trim(candidate)
+
     prompt = f"""
-Compare the CANDIDATE DOCUMENT with the REQUIREMENTS.
-
-Return JSON ONLY:
-
+Compare the candidate document with the requirements.
+Return JSON:
 {{
   "match_score": 0-100,
   "status": "GREEN | YELLOW | RED",
@@ -163,9 +144,8 @@ CANDIDATE:
 
     return response.output_text
 
-
 # ======================================================
-#   MAIN ENDPOINT — /compare_files
+#   GALVENĀ API /compare_files
 # ======================================================
 
 @app.post("/compare_files")
@@ -174,52 +154,44 @@ async def compare_files(
     candidates: List[UploadFile] = File(...)
 ):
 
-    # ------------------------------------
-    # 1) Extract REQUIREMENT documents
-    # ------------------------------------
+    full_req_text = ""
 
-    req_text = ""
-
+    # 1) Ekstrahējam prasības
     for f in requirements:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
 
-        fn = f.filename.lower()
+        name = f.filename.lower()
 
-        if fn.endswith(".pdf"):
-            req_text += extract_pdf(p)
-        elif fn.endswith(".docx"):
-            req_text += extract_docx(p)
-        elif fn.endswith(".edoc"):
-            req_text += extract_edoc(p)
-        elif fn.endswith(".zip"):
-            req_text += extract_zip(p)
+        if name.endswith(".pdf"):
+            full_req_text += extract_pdf(p)
+        elif name.endswith(".docx"):
+            full_req_text += extract_docx(p)
+        elif name.endswith(".zip"):
+            full_req_text += extract_zip(p)
         else:
-            raise HTTPException(400, f"Unsupported requirement file: {fn}")
+            raise HTTPException(400, f"Unsupported file: {name}")
 
         os.unlink(p)
 
-    if not req_text.strip():
-        return {"error": "No readable text found in requirement files."}
+    if not full_req_text.strip():
+        return {"error": "No readable text in requirements."}
 
-    requirements_json = ai_parse_requirements(req_text)
+    # GPT prasību analīze
+    req_json = ai_parse_requirements(full_req_text)
 
-    # ------------------------------------
-    # 2) Extract CANDIDATE ZIP files
-    # ------------------------------------
-
+    # 2) Kandidātu analīze
     results = []
 
     for f in candidates:
+
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
 
-        fn = f.filename.lower()
-
-        if not fn.endswith(".zip"):
-            raise HTTPException(400, f"Candidate must be a ZIP archive: {fn}")
+        if not f.filename.lower().endswith(".zip"):
+            raise HTTPException(400, "Candidate must be ZIP.")
 
         cand_text = extract_zip(p)
         os.unlink(p)
@@ -227,23 +199,20 @@ async def compare_files(
         if not cand_text.strip():
             results.append({
                 "candidate": f.filename,
-                "error": "Empty or unreadable candidate ZIP"
+                "error": "Empty or unreadable ZIP"
             })
             continue
 
-        analysis_json = ai_compare(requirements_json, cand_text)
+        eval_json = ai_compare(req_json, cand_text)
 
         results.append({
             "candidate": f.filename,
-            "analysis": analysis_json
+            "analysis": eval_json
         })
 
-    # ------------------------------------
-    # 3) Return final JSON
-    # ------------------------------------
-
+    # 3) Gala rezultāts
     return {
         "status": "ok",
-        "requirements_structured": requirements_json,
+        "requirements_structured": req_json,
         "candidate_analysis": results
     }
