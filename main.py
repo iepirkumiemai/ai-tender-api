@@ -1,230 +1,192 @@
-# ============================================================
-# main.py — AI Tender Analyzer (Separate File Analysis Mode)
-# ============================================================
-
 import os
 import zipfile
 import tempfile
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
+from PyPDF2 import PdfReader
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+app = FastAPI()
 
-app = FastAPI(title="Tender Analyzer", version="1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+# ==============================
+# 1) Būvējam drošu DOCX parseri Railway videi
+# ==============================
+def extract_text_from_docx(path: str) -> str:
+    """Extract text from DOCX using built-in ZIP + XML parsing (Railway-safe)."""
+    try:
+        with zipfile.ZipFile(path) as docx:
+            xml = docx.read("word/document.xml").decode("utf-8", errors="ignore")
 
-# ============================================================
-# Extract TEXT from supported file types
-# ============================================================
+        # Pamatapstrāde
+        xml = xml.replace("</w:p>", "\n").replace("<w:t>", "").replace("</w:t>", "")
 
-def extract_text_from_file(path: str, name: str) -> str:
-    name = name.lower()
+        import re
+        text = re.sub(r"<[^>]+>", "", xml)
 
-    # PDF — minimalistic extractor (OpenAI handles missing bits)
-    if name.endswith(".pdf"):
-        try:
-            from pdfminer.high_level import extract_text
-            return extract_text(path)
-        except:
-            return ""
+        return text.strip()
+    except:
+        return ""
 
-    # DOCX
+
+# ==============================
+# 2) PDF parseris
+# ==============================
+def extract_text_from_pdf(path: str) -> str:
+    try:
+        reader = PdfReader(path)
+        text = ""
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            text += txt + "\n"
+        return text.strip()
+    except:
+        return ""
+
+
+# ==============================
+# 3) TXT parseris
+# ==============================
+def extract_text_from_txt(path: str) -> str:
+    try:
+        return open(path, "r", encoding="utf-8", errors="ignore").read()
+    except:
+        return ""
+
+
+# ==============================
+# 4) Universālais parseris
+# ==============================
+def extract_text_from_file(path: str) -> str:
+    name = path.lower()
+
     if name.endswith(".docx"):
-        try:
-            import mammoth
-            with open(path, "rb") as f:
-                result = mammoth.extract_raw_text(f)
-                return result.value
-        except:
-            return ""
+        return extract_text_from_docx(path)
 
-    # EDOC (XML container)
-    if name.endswith(".edoc") or name.endswith(".xml"):
-        try:
-            text = ""
-            with zipfile.ZipFile(path, "r") as z:
-                for entry in z.namelist():
-                    if entry.endswith(".xml") or entry.endswith(".txt"):
-                        text += z.read(entry).decode(errors="ignore")
-            return text
-        except:
-            return ""
+    if name.endswith(".pdf"):
+        return extract_text_from_pdf(path)
 
-    # TXT / HTML
-    if name.endswith(".txt") or name.endswith(".html"):
-        try:
-            return open(path, "r", encoding="utf-8", errors="ignore").read()
-        except:
-            return ""
+    if name.endswith(".txt"):
+        return extract_text_from_txt(path)
 
     return ""
 
 
-# ============================================================
-# Separate extraction for ZIP → returns list of (filename, text)
-# ============================================================
+# ==============================
+# 5) GPT-4o tendera analīze (droša, ar token limitu)
+# ==============================
+def ai_analyze(requirements: str, candidate: str) -> str:
 
-def extract_zip_separate(path: str):
+    max_chunk = 7000  # Droši GPT-4o robežās
+
+    def chunks(text):
+        for i in range(0, len(text), max_chunk):
+            yield text[i:i+max_chunk]
+
+    summary = ""
+
+    for part in chunks(candidate):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content":
+                        "You are an EU public procurement expert. Compare candidate offer "
+                        "with requirements and return a structured analysis: Score (0–100), "
+                        "Strengths, Weaknesses, Legal Risks, Final Verdict."
+                },
+                {"role": "user",
+                 "content": f"REQUIREMENTS:\n{requirements}\n\nCANDIDATE PART:\n{part}"}
+            ]
+        )
+
+        summary += "\n" + response.choices[0].message.content
+
+    return summary.strip()
+
+
+# ==============================
+# 6) ZIP kandidātu ielāde
+# ==============================
+def extract_candidates(zip_path: str):
     results = []
+    folder = tempfile.mkdtemp()
 
-    with zipfile.ZipFile(path, "r") as z:
-        for name in z.namelist():
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(folder)
 
-            if name.endswith("/"):
-                continue
+        for root, _, files in os.walk(folder):
+            for f in files:
+                fpath = os.path.join(root, f)
+                text = extract_text_from_file(fpath)
+                if text.strip():
+                    results.append((os.path.splitext(f)[0], text))
 
-            # Save entry to temp
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(z.read(name))
-                p = tmp.name
-
-            text = extract_text_from_file(p, name)
-
-            results.append({"filename": name, "text": text})
-
-            os.unlink(p)
+    except:
+        pass
 
     return results
 
 
-# ============================================================
-# AI — Compare single candidate file with requirements
-# ============================================================
-
-def ai_compare_single(requirements: str, candidate_text: str, fname: str) -> str:
-
-    prompt = f"""
-You are an expert in EU procurement evaluation.
-
-Compare the following candidate document **separately** with the requirements.
-
-Return STRICT MARKDOWN.
-
-Document Name: {fname}
-
-REQUIREMENTS:
-{requirements}
-
-CANDIDATE FILE CONTENT:
-{candidate_text}
-
-RETURN FORMAT (MANDATORY):
-
-### File: {fname}
-
-1. **Score (0–100):** ...
-2. **Strengths:** list
-3. **Weaknesses:** list
-4. **Legal/Compliance Risk Level:** LOW | MEDIUM | HIGH
-5. **Verdict:** PASS | FAIL
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2500,
-        temperature=0
-    )
-
-    return response.choices[0].message.content
-
-
-# ============================================================
-# AI — Compress requirements to safe token length
-# ============================================================
-
-def ai_compress_requirements(text: str) -> str:
-
-    prompt = f"""
-Shorten this requirements document to a compact summary keeping all legal,
-financial, and technical criteria necessary for evaluating offers.
-
-Return short text (max 1200 words).
-TEXT:
-{text}
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1500,
-        temperature=0
-    )
-
-    return response.choices[0].message.content
-
-
-# ============================================================
-# MAIN ENDPOINT /analyze
-# ============================================================
-
+# ==============================
+# 7) API endpoint — /analyze
+# ==============================
 @app.post("/analyze", response_class=HTMLResponse)
-async def analyze(
-    requirements_file: UploadFile = File(...),
-    candidate_zip: UploadFile = File(...)
-):
+async def analyze(requirements_file: UploadFile = File(...),
+                  candidate_zip: UploadFile = File(...)):
 
-    # ================= Requirements ==================
+    # Saglabā prasību failu
     req_tmp = tempfile.NamedTemporaryFile(delete=False)
     req_tmp.write(await requirements_file.read())
     req_tmp.close()
 
-    requirements_text = extract_text_from_file(req_tmp.name, requirements_file.filename)
-    os.unlink(req_tmp.name)
+    requirements_text = extract_text_from_file(req_tmp.name)
 
-    if len(requirements_text) < 50:
-        return HTMLResponse("<h2>Requirements file unreadable or empty.</h2>")
+    if not requirements_text.strip():
+        return HTMLResponse("<h2>Requirements file unreadable or empty.</h2>", status_code=200)
 
-    # Compress to avoid token overflow
-    compressed_req = ai_compress_requirements(requirements_text)
-
-    # ================= Candidates ZIP ==================
+    # Saglabā kandidātu ZIP
     zip_tmp = tempfile.NamedTemporaryFile(delete=False)
     zip_tmp.write(await candidate_zip.read())
     zip_tmp.close()
 
-    extracted_files = extract_zip_separate(zip_tmp.name)
-    os.unlink(zip_tmp.name)
+    candidates = extract_candidates(zip_tmp.name)
 
-    # ================= AI evaluation ==================
-    rows = ""
+    if not candidates:
+        return HTMLResponse("<h2>No readable candidate files found inside ZIP.</h2>", status_code=200)
 
-    for f in extracted_files:
-        fname = f["filename"]
-        text = f["text"]
-
-        if len(text.strip()) < 20:
-            evaluation = "Empty or unreadable file."
-        else:
-            evaluation = ai_compare_single(compressed_req, text, fname)
-
-        rows += f"<tr><td>{fname}</td><td><pre>{evaluation}</pre></td></tr>"
-
-    # ================= HTML output ==================
-    html = f"""
+    # Veicam analīzi
+    html = """
     <html><head>
     <style>
-        body {{ font-family: Arial; padding: 20px; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th, td {{ padding: 10px; border: 1px solid #ccc; vertical-align: top; }}
-        th {{ background: #f0f0f0; }}
-        pre {{ white-space: pre-wrap; }}
+    body { font-family: Arial; padding: 20px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px; border: 1px solid #ccc; vertical-align: top; }
+    th { background: #eee; }
+    pre { white-space: pre-wrap; }
     </style>
     </head><body>
-    <h2>Tender Evaluation Result (Separate File Analysis)</h2>
+    <h2>Tender Analysis Result</h2>
     <table>
-        <tr><th>File</th><th>Evaluation</th></tr>
-        {rows}
-    </table>
-    </body></html>
+        <tr>
+            <th>Candidate</th>
+            <th>Evaluation</th>
+        </tr>
     """
 
-    return HTMLResponse(html)
+    for name, text in candidates:
+        result = ai_analyze(requirements_text, text)
+
+        html += f"""
+        <tr>
+            <td>{name}</td>
+            <td><pre>{result}</pre></td>
+        </tr>
+        """
+
+    html += "</table></body></html>"
+
+    return HTMLResponse(content=html, status_code=200)
