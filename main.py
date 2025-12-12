@@ -4,15 +4,15 @@ import zipfile
 import datetime
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from openai import OpenAI
-import mammoth
 from pdfminer.high_level import extract_text
+from docx import Document
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer", version="1.0")
+app = FastAPI(title="AI Tender Analyzer", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,30 +21,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-#               HELPERS: FILE EXTRACTION
-# ---------------------------------------------------------
+# ===========================
+# HELPERS
+# ===========================
 
 def clean(text):
     if not text:
         return ""
     return text.replace("\x00", "").strip()
 
-def extract_pdf(path: str) -> str:
+def extract_pdf(path):
     try:
         return clean(extract_text(path))
     except:
         return ""
 
-def extract_docx(path: str) -> str:
+def extract_docx(path):
     try:
-        with open(path, "rb") as f:
-            result = mammoth.extract_raw_text(f)
-            return clean(result.value)
+        doc = Document(path)
+        return "\n".join([p.text for p in doc.paragraphs])
     except:
         return ""
 
-def extract_edoc(path: str) -> str:
+def extract_edoc(path):
     text = ""
     try:
         with zipfile.ZipFile(path, "r") as z:
@@ -55,15 +54,11 @@ def extract_edoc(path: str) -> str:
         pass
     return text
 
-def extract_zip(path: str) -> dict:
-    """
-    Returns {filename: extracted_text}
-    """
+def extract_zip(path):
     results = {}
 
     with zipfile.ZipFile(path, "r") as z:
         for name in z.namelist():
-
             if name.endswith("/"):
                 continue
 
@@ -91,15 +86,14 @@ def extract_zip(path: str) -> dict:
     return results
 
 
-# ---------------------------------------------------------
-#            GPT-4o: REQUIREMENTS EXTRACTION
-# ---------------------------------------------------------
+# ======================================
+#   GPT FUNCTIONS
+# ======================================
 
-def ai_extract_requirements(text: str) -> list:
+def ai_extract_requirements(text):
     prompt = f"""
-Izanalizē turpmāko iepirkuma prasību tekstu un izvelc VISAS prasības tādā secībā,
-kādā tās parādās dokumentā. Neizdomā nekādas kategorijas.
-Struktūra:
+Izvelc VISAS prasības no dokumenta. Saglabā secību.
+Formāts:
 
 [
   {{
@@ -108,7 +102,7 @@ Struktūra:
   }}
 ]
 
-TEKSTS:
+Dokuments:
 {text}
 """
 
@@ -120,33 +114,29 @@ TEKSTS:
     return resp.output_text
 
 
-# ---------------------------------------------------------
-#        GPT-4o: REQUIREMENT vs DOCUMENT COMPARISON
-# ---------------------------------------------------------
-
-def ai_compare(req_json: str, candidate_text: str) -> str:
+def ai_compare(req_json, candidate_text):
     prompt = f"""
 Salīdzini prasības ar kandidāta dokumentiem.
+
 Katru prasību izvērtē:
+- Atbilst
+- Daļēji atbilst
+- Neatbilst
 
-- "Atbilst"
-- "Daļēji atbilst"
-- "Neatbilst"
-
-SEMANTISKAIS PAMATOJUMS obligāts. Formatēšana:
+Formāts:
 
 [
   {{
     "prasība": "...",
-    "statuss": "Atbilst/Daļēji atbilst/Neatbilst",
+    "statuss": "Atbilst / Daļēji atbilst / Neatbilst",
     "pamatojums": "..."
   }}
 ]
 
-PRASĪBAS JSON:
+Prasības:
 {req_json}
 
-KANDIDĀTA DOKUMENTU TEKSTS:
+Kandidāta dokumenti:
 {candidate_text}
 """
 
@@ -158,47 +148,45 @@ KANDIDĀTA DOKUMENTU TEKSTS:
     return resp.output_text
 
 
-# ---------------------------------------------------------
-#              HTML REPORT GENERATION
-# ---------------------------------------------------------
+# ======================================
+#   HTML BUILDER
+# ======================================
 
 def build_html(requirements, comparisons, filename):
-    html = """
+    html = f"""
 <html><head>
 <meta charset='UTF-8'>
 <style>
-body { font-family: Arial; padding: 20px; }
-h1 { color: #333; }
-h2 { margin-top: 30px; }
-.req-block { margin-bottom: 20px; padding: 10px; border:1px solid #ccc; border-radius:6px;}
-.status-green { color: green; font-weight: bold; }
-.status-yellow { color: orange; font-weight: bold; }
-.status-red { color: red; font-weight: bold; }
-pre { white-space: pre-wrap; }
+body {{ font-family: Arial; padding: 20px; }}
+.req {{ margin-bottom: 20px; padding: 10px; border:1px solid #ccc; }}
+pre {{ white-space: pre-wrap; }}
 </style>
 </head><body>
 
 <h1>Tendera analīzes atskaite</h1>
-<p><b>Faila nosaukums:</b> """ + filename + "</p>"
+<p><b>Faila nosaukums:</b> {filename}</p>
 
-    html += "<h2>Prasību saraksts</h2><pre>" + requirements + "</pre>"
-    html += "<h2>Kandidāta salīdzināšana</h2><pre>" + comparisons + "</pre>"
-    html += "</body></html>"
+<h2>Prasību saraksts</h2>
+<pre>{requirements}</pre>
 
+<h2>Kandidāta salīdzināšana</h2>
+<pre>{comparisons}</pre>
+
+</body></html>
+"""
     return html
 
 
-# ---------------------------------------------------------
-#                    MAIN ENDPOINT
-# ---------------------------------------------------------
+# ======================================
+#              ENDPOINT
+# ======================================
 
 @app.post("/analyze")
 async def analyze(requirements: list[UploadFile] = File(...),
                   candidates: list[UploadFile] = File(...)):
-    # -------------------------------
-    # 1) READ REQUIREMENTS
-    # -------------------------------
-    full_requirements_text = ""
+
+    # 1) Read requirements
+    req_text = ""
 
     for f in requirements:
         tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -208,71 +196,52 @@ async def analyze(requirements: list[UploadFile] = File(...),
         name = f.filename.lower()
 
         if name.endswith(".pdf"):
-            full_requirements_text += extract_pdf(tmp.name)
+            req_text += extract_pdf(tmp.name)
         elif name.endswith(".docx"):
-            full_requirements_text += extract_docx(tmp.name)
+            req_text += extract_docx(tmp.name)
         elif name.endswith(".edoc"):
-            full_requirements_text += extract_edoc(tmp.name)
+            req_text += extract_edoc(tmp.name)
         elif name.endswith(".zip"):
-            texts = extract_zip(tmp.name)
-            for _, t in texts.items():
-                full_requirements_text += t
+            parts = extract_zip(tmp.name)
+            for t in parts.values():
+                req_text += t
 
         os.unlink(tmp.name)
 
-    if not full_requirements_text.strip():
-        raise HTTPException(400, "Neizdevās nolasīt prasību failu saturu.")
+    if not req_text.strip():
+        raise HTTPException(400, "Prasību dokumentu nevarēja nolasīt.")
 
-    # 2) GPT: extract requirements
-    req_structured = ai_extract_requirements(full_requirements_text)
+    req_structured = ai_extract_requirements(req_text)
 
-    # -------------------------------
-    # 3) READ CANDIDATES
-    # -------------------------------
-    final_comparison = ""
+    # 2) Candidate evaluation
+    final_comp = ""
 
     for f in candidates:
         tmp = tempfile.NamedTemporaryFile(delete=False)
         tmp.write(await f.read())
         tmp.close()
 
-        name = f.filename
         extracted = extract_zip(tmp.name)
-
         cand_text = "\n\n".join(extracted.values())
-
         os.unlink(tmp.name)
 
-        if not cand_text.strip():
-            final_comparison += f"\n\nDokuments {name}: tukšs vai nenolasāms."
-            continue
-
         comp = ai_compare(req_structured, cand_text)
-        final_comparison += f"\n\n=== {name} ===\n" + comp
+        final_comp += f"\n\n=== {f.filename} ===\n{comp}"
 
-    # -------------------------------
-    # 4) HTML REPORT
-    # -------------------------------
-
+    # 3) Produce HTML report
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"/tmp/report_{timestamp}.html"
+    path = f"/tmp/report_{timestamp}.html"
 
-    html = build_html(req_structured, final_comparison, "Tender Analysis")
-    with open(report_path, "w", encoding="utf-8") as f:
+    html = build_html(req_structured, final_comp, "Tender Analysis")
+    with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    url = f"/download/{Path(report_path).name}"
+    return {"status": "ok", "url": f"/download/{Path(path).name}"}
 
-    return {"status": "ok", "report_url": url}
-
-
-# ---------------------------------------------------------
-#       FILE DOWNLOAD ENDPOINT
-# ---------------------------------------------------------
 
 @app.get("/download/{filename}")
 async def download(filename: str):
     path = f"/tmp/{filename}"
     if not os.path.exists(path):
-        raise HTTPException(404, "Fails nav atrasts")
+        raise HTTPException(404, "Fails nav atrasts.")
     return FileResponse(path, media_type="text/html")
