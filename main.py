@@ -1,152 +1,162 @@
-# ===============================================
-# main.py — Tender Comparison API (A-Variant Safe Mode)
-# ===============================================
+# ============================================================
+# main.py — AI Tender Engine (Stable HTML Download Version)
+# ============================================================
 
 import os
 import zipfile
 import tempfile
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, Response
 from typing import List
 from openai import OpenAI
-import PyPDF2
-import mammoth
+from pdfminer.high_level import extract_text
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(
-    title="AI Tender Comparison Engine — A Variant",
+    title="AI Tender Engine",
     version="1.0",
-    description="Safe mode: text trimming to avoid context overflow."
+    description="Stable version with HTML downloadable output."
 )
 
-# ======================================================
-#   TEKSTA TĪRĪTĀJS
-# ======================================================
+
+# ============================================================
+#  TEXT CLEANER
+# ============================================================
 
 def clean(text: str) -> str:
     return text.replace("\x00", "").strip()
 
-# Limita izmērs (A-variantam pietiek)
-MAX_TEXT = 30000
 
-
-def trim(text: str) -> str:
-    """Apgriež tekstu līdz 30 000 simboliem, lai nepieļautu GPT konteksta pārsniegšanu."""
-    if len(text) > MAX_TEXT:
-        return text[:MAX_TEXT]
-    return text
-
-# ======================================================
-#   FAILU EKSTRAKTORI
-# ======================================================
+# ============================================================
+#  FILE EXTRACTORS (PDF, DOCX, EDOC, ZIP)
+# ============================================================
 
 def extract_pdf(path: str) -> str:
     try:
-        text = ""
-        with open(path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                text += page.extract_text() or ""
-        return clean(text)
+        return clean(extract_text(path))
     except:
         return ""
 
 
 def extract_docx(path: str) -> str:
+    # DOCX is a ZIP → minimal extractor
+    text = ""
     try:
-        with open(path, "rb") as f:
-            result = mammoth.extract_raw_text(f)
-            return clean(result.value)
+        with zipfile.ZipFile(path, "r") as z:
+            for name in z.namelist():
+                if name.endswith(".xml"):
+                    try:
+                        xml = z.read(name).decode("utf-8", errors="ignore")
+                        text += clean(xml)
+                    except:
+                        continue
     except:
-        return ""
+        pass
+    return text
+
+
+def extract_edoc(path: str) -> str:
+    text = ""
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for n in z.namelist():
+                if n.endswith(".xml") or n.endswith(".txt"):
+                    try:
+                        text += clean(z.read(n).decode("utf-8", errors="ignore"))
+                    except:
+                        continue
+    except:
+        pass
+    return text
 
 
 def extract_zip(path: str) -> str:
-    combined = ""
-    with zipfile.ZipFile(path, "r") as z:
-        for name in z.namelist():
+    result = ""
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for n in z.namelist():
+                if n.endswith("/"):
+                    continue
+                data = z.read(n)
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(data)
+                    p = tmp.name
+                n_low = n.lower()
 
-            if name.endswith("/"):
-                continue
+                if n_low.endswith(".pdf"):
+                    result += extract_pdf(p)
+                elif n_low.endswith(".docx"):
+                    result += extract_docx(p)
+                elif n_low.endswith(".edoc"):
+                    result += extract_edoc(p)
+                elif n_low.endswith(".zip"):
+                    result += extract_zip(p)
 
-            # izvelkam failu
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(z.read(name))
-                tmp_path = tmp.name
+                os.unlink(p)
+    except:
+        pass
+    return clean(result)
 
-            if name.lower().endswith(".pdf"):
-                combined += extract_pdf(tmp_path)
 
-            elif name.lower().endswith(".docx"):
-                combined += extract_docx(tmp_path)
+# ============================================================
+#  AI FUNCTIONS
+# ============================================================
 
-            os.unlink(tmp_path)
-
-    return combined
-
-# ======================================================
-#   AI FUNKCIJAS (AR TRIMMING)
-# ======================================================
-
-def ai_parse_requirements(text: str) -> str:
-
-    text = trim(text)
-
+def ai_requirements(text: str) -> str:
     prompt = f"""
-Extract key requirements from this document and return JSON:
-{{
-  "summary": "...",
-  "requirements": [...],
-  "key_points": [...],
-  "risks": [...]
-}}
-TEXT:
+You are an AI that extracts tender requirements.
+
+Return a short structured summary:
+
+- Key requirements list
+- Mandatory conditions
+- Evaluation criteria
+
+Respond strictly in HTML <div> elements.
+Here is the document text:
 {text}
 """
-
-    response = client.responses.create(
+    r = client.responses.create(
         model="gpt-4o",
         input=prompt
     )
+    return r.output_text
 
-    return response.output_text
 
-
-def ai_compare(requirements: str, candidate: str) -> str:
-
-    requirements = trim(requirements)
-    candidate = trim(candidate)
-
+def ai_candidate(req_html: str, candidate_text: str) -> str:
     prompt = f"""
-Compare the candidate document with the requirements.
-Return JSON:
-{{
-  "match_score": 0-100,
-  "status": "GREEN | YELLOW | RED",
-  "matched_requirements": [...],
-  "missing_requirements": [...],
-  "risks": [...],
-  "summary": "..."
-}}
+You are comparing a candidate ZIP with tender requirements.
 
-REQUIREMENTS:
-{requirements}
+Requirements (HTML):
+{req_html}
 
-CANDIDATE:
-{candidate}
+Candidate text:
+{candidate_text}
+
+Return STRICT HTML with:
+
+<h2>Match Score (0-100)</h2>
+<h2>Status: GREEN / YELLOW / RED</h2>
+<h2>Matched Requirements</h2>
+<ul>...</ul>
+<h2>Missing Requirements</h2>
+<ul>...</ul>
+<h2>Risks</h2>
+<ul>...</ul>
+<h2>Summary</h2>
+<p>...</p>
 """
-
-    response = client.responses.create(
+    r = client.responses.create(
         model="gpt-4o",
         input=prompt
     )
+    return r.output_text
 
-    return response.output_text
 
-# ======================================================
-#   GALVENĀ API /compare_files
-# ======================================================
+# ============================================================
+#  MAIN ENDPOINT — RETURNS DOWNLOADABLE HTML
+# ============================================================
 
 @app.post("/compare_files")
 async def compare_files(
@@ -154,65 +164,91 @@ async def compare_files(
     candidates: List[UploadFile] = File(...)
 ):
 
-    full_req_text = ""
-
-    # 1) Ekstrahējam prasības
+    # ---- Extract requirements ----
+    req_text = ""
     for f in requirements:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
-
         name = f.filename.lower()
 
         if name.endswith(".pdf"):
-            full_req_text += extract_pdf(p)
+            req_text += extract_pdf(p)
         elif name.endswith(".docx"):
-            full_req_text += extract_docx(p)
+            req_text += extract_docx(p)
+        elif name.endswith(".edoc"):
+            req_text += extract_edoc(p)
         elif name.endswith(".zip"):
-            full_req_text += extract_zip(p)
+            req_text += extract_zip(p)
         else:
-            raise HTTPException(400, f"Unsupported file: {name}")
+            raise HTTPException(400, f"Unsupported requirement file: {name}")
 
         os.unlink(p)
 
-    if not full_req_text.strip():
-        return {"error": "No readable text in requirements."}
+    if not req_text.strip():
+        raise HTTPException(400, "No readable text in requirements.")
 
-    # GPT prasību analīze
-    req_json = ai_parse_requirements(full_req_text)
+    # ---- AI: Requirements HTML block ----
+    req_html = ai_requirements(req_text)
 
-    # 2) Kandidātu analīze
-    results = []
+    # ---- AI: Candidates ----
+    final_html = """
+<html>
+<head>
+<title>Tender Analysis</title>
+<style>
+body { font-family: Arial; padding: 20px; }
+.green { color: green; font-weight: bold; }
+.yellow { color: orange; font-weight: bold; }
+.red { color: red; font-weight: bold; }
+.block { border:1px solid #ddd; padding:15px; margin-bottom:20px; }
+</style>
+</head>
+<body>
+<h1>Tender Comparison Report</h1>
+<h2>Requirements Summary</h2>
+<div class="block">
+""" + req_html + "</div>"
 
+    # ---- Process each candidate ----
     for f in candidates:
-
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await f.read())
             p = tmp.name
+        name = f.filename.lower()
 
-        if not f.filename.lower().endswith(".zip"):
-            raise HTTPException(400, "Candidate must be ZIP.")
+        if not name.endswith(".zip"):
+            raise HTTPException(400, f"Candidate must be ZIP: {name}")
 
         cand_text = extract_zip(p)
         os.unlink(p)
 
         if not cand_text.strip():
-            results.append({
-                "candidate": f.filename,
-                "error": "Empty or unreadable ZIP"
-            })
-            continue
+            cand_html = "<p class='red'>UNREADABLE ZIP</p>"
+        else:
+            cand_html = ai_candidate(req_html, cand_text)
 
-        eval_json = ai_compare(req_json, cand_text)
+        final_html += f"""
+        <h2>Candidate: {f.filename}</h2>
+        <div class="block">{cand_html}</div>
+        """
 
-        results.append({
-            "candidate": f.filename,
-            "analysis": eval_json
-        })
+    final_html += "</body></html>"
 
-    # 3) Gala rezultāts
-    return {
-        "status": "ok",
-        "requirements_structured": req_json,
-        "candidate_analysis": results
-    }
+    # ---- Return as downloadable HTML file ----
+    return Response(
+        content=final_html,
+        media_type="text/html",
+        headers={
+            "Content-Disposition": "attachment; filename=analysis.html"
+        }
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
