@@ -1,254 +1,180 @@
-# ============================================================
-# main.py — AI Tender Engine (Stable HTML Download Version)
-# ============================================================
-
 import os
-import zipfile
+import json
 import tempfile
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, Response
-from typing import List
+import zipfile
+from typing import List, Dict
+
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from PyPDF2 import PdfReader
+from docx import Document
 from openai import OpenAI
-from pdfminer.high_level import extract_text
+
+
+app = FastAPI(title="AI Iepirkumi – Document Analyzer", version="2.0")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(
-    title="AI Tender Engine",
-    version="1.0",
-    description="Stable version with HTML downloadable output."
-)
-
 
 # ============================================================
-#  TEXT CLEANER
+# FAILU NOLASĪŠANA
 # ============================================================
 
-def clean(text: str) -> str:
-    return text.replace("\x00", "").strip()
-
-
-# ============================================================
-#  FILE EXTRACTORS (PDF, DOCX, EDOC, ZIP)
-# ============================================================
-
-def extract_pdf(path: str) -> str:
+def read_pdf(file_path: str) -> str:
     try:
-        return clean(extract_text(path))
-    except:
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
+    except Exception:
         return ""
 
 
-def extract_docx(path: str) -> str:
-    # DOCX is a ZIP → minimal extractor
-    text = ""
+def read_docx(file_path: str) -> str:
     try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if name.endswith(".xml"):
-                    try:
-                        xml = z.read(name).decode("utf-8", errors="ignore")
-                        text += clean(xml)
-                    except:
-                        continue
-    except:
-        pass
+        doc = Document(file_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    except Exception:
+        return ""
+
+
+def read_txt(file_path: str) -> str:
+    try:
+        return open(file_path, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return ""
+
+
+def read_zip(file_path: str) -> str:
+    text = ""
+    with zipfile.ZipFile(file_path, "r") as z:
+        for name in z.namelist():
+            with z.open(name) as f:
+                try:
+                    content = f.read().decode("utf-8", errors="ignore")
+                    text += "\n\n===== FILE: " + name + " =====\n\n"
+                    text += content
+                except Exception:
+                    pass
     return text
 
 
-def extract_edoc(path: str) -> str:
-    text = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for n in z.namelist():
-                if n.endswith(".xml") or n.endswith(".txt"):
-                    try:
-                        text += clean(z.read(n).decode("utf-8", errors="ignore"))
-                    except:
-                        continue
-    except:
-        pass
-    return text
+def load_document(file: UploadFile) -> str:
+    suffix = file.filename.lower()
 
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(file.file.read())
+        tmp_path = tmp.name
 
-def extract_zip(path: str) -> str:
-    result = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for n in z.namelist():
-                if n.endswith("/"):
-                    continue
-                data = z.read(n)
-                with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                    tmp.write(data)
-                    p = tmp.name
-                n_low = n.lower()
+    if suffix.endswith(".pdf"):
+        return read_pdf(tmp_path)
 
-                if n_low.endswith(".pdf"):
-                    result += extract_pdf(p)
-                elif n_low.endswith(".docx"):
-                    result += extract_docx(p)
-                elif n_low.endswith(".edoc"):
-                    result += extract_edoc(p)
-                elif n_low.endswith(".zip"):
-                    result += extract_zip(p)
+    if suffix.endswith(".docx"):
+        return read_docx(tmp_path)
 
-                os.unlink(p)
-    except:
-        pass
-    return clean(result)
+    if suffix.endswith(".txt"):
+        return read_txt(tmp_path)
+
+    if suffix.endswith(".zip") or suffix.endswith(".edoc"):
+        return read_zip(tmp_path)
+
+    return ""
 
 
 # ============================================================
-#  AI FUNCTIONS
+# BLOKU SADALĪŠANA — 20 000 rakstzīmes
 # ============================================================
 
-def ai_requirements(text: str) -> str:
+def split_into_blocks(text: str, block_size: int = 20000) -> List[str]:
+    return [text[i:i + block_size] for i in range(0, len(text), block_size)]
+
+
+# ============================================================
+# GPT ANALĪZE
+# ============================================================
+
+def analyze_block(block_text: str, block_number: int) -> Dict:
     prompt = f"""
-You are an AI that extracts tender requirements.
+You are an AI tender analysis engine.
 
-Return a short structured summary:
+Analyze the following document block #{block_number}.
+Extract:
+- Requirements
+- Criteria
+- Constraints
+- Expected deliverables
+- Anything relevant as input for procurement evaluation.
 
-- Key requirements list
-- Mandatory conditions
-- Evaluation criteria
+Return structured JSON.
 
-Respond strictly in HTML <div> elements.
-Here is the document text:
-{text}
+BLOCK CONTENT:
+{block_text}
 """
-    r = client.responses.create(
+
+    response = client.responses.create(
         model="gpt-4o",
-        input=prompt
+        input=prompt,
     )
-    return r.output_text
 
-
-def ai_candidate(req_html: str, candidate_text: str) -> str:
-    prompt = f"""
-You are comparing a candidate ZIP with tender requirements.
-
-Requirements (HTML):
-{req_html}
-
-Candidate text:
-{candidate_text}
-
-Return STRICT HTML with:
-
-<h2>Match Score (0-100)</h2>
-<h2>Status: GREEN / YELLOW / RED</h2>
-<h2>Matched Requirements</h2>
-<ul>...</ul>
-<h2>Missing Requirements</h2>
-<ul>...</ul>
-<h2>Risks</h2>
-<ul>...</ul>
-<h2>Summary</h2>
-<p>...</p>
-"""
-    r = client.responses.create(
-        model="gpt-4o",
-        input=prompt
-    )
-    return r.output_text
+    try:
+        data = json.loads(response.output[0].content[0].text)
+        return data
+    except Exception:
+        return {"block": block_number, "raw_text": response.output[0].content[0].text}
 
 
 # ============================================================
-#  MAIN ENDPOINT — RETURNS DOWNLOADABLE HTML
+# HTML IZVEIDE
 # ============================================================
 
-@app.post("/compare_files")
-async def compare_files(
-    requirements: List[UploadFile] = File(...),
-    candidates: List[UploadFile] = File(...)
-):
-
-    # ---- Extract requirements ----
-    req_text = ""
-    for f in requirements:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(await f.read())
-            p = tmp.name
-        name = f.filename.lower()
-
-        if name.endswith(".pdf"):
-            req_text += extract_pdf(p)
-        elif name.endswith(".docx"):
-            req_text += extract_docx(p)
-        elif name.endswith(".edoc"):
-            req_text += extract_edoc(p)
-        elif name.endswith(".zip"):
-            req_text += extract_zip(p)
-        else:
-            raise HTTPException(400, f"Unsupported requirement file: {name}")
-
-        os.unlink(p)
-
-    if not req_text.strip():
-        raise HTTPException(400, "No readable text in requirements.")
-
-    # ---- AI: Requirements HTML block ----
-    req_html = ai_requirements(req_text)
-
-    # ---- AI: Candidates ----
-    final_html = """
+def generate_html(results_json: Dict) -> str:
+    html = """
 <html>
 <head>
-<title>Tender Analysis</title>
 <style>
 body { font-family: Arial; padding: 20px; }
-.green { color: green; font-weight: bold; }
-.yellow { color: orange; font-weight: bold; }
-.red { color: red; font-weight: bold; }
-.block { border:1px solid #ddd; padding:15px; margin-bottom:20px; }
+pre { background: #f0f0f0; padding: 15px; border-radius: 5px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<h1>Tender Comparison Report</h1>
-<h2>Requirements Summary</h2>
-<div class="block">
-""" + req_html + "</div>"
-
-    # ---- Process each candidate ----
-    for f in candidates:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(await f.read())
-            p = tmp.name
-        name = f.filename.lower()
-
-        if not name.endswith(".zip"):
-            raise HTTPException(400, f"Candidate must be ZIP: {name}")
-
-        cand_text = extract_zip(p)
-        os.unlink(p)
-
-        if not cand_text.strip():
-            cand_html = "<p class='red'>UNREADABLE ZIP</p>"
-        else:
-            cand_html = ai_candidate(req_html, cand_text)
-
-        final_html += f"""
-        <h2>Candidate: {f.filename}</h2>
-        <div class="block">{cand_html}</div>
-        """
-
-    final_html += "</body></html>"
-
-    # ---- Return as downloadable HTML file ----
-    return Response(
-        content=final_html,
-        media_type="text/html",
-        headers={
-            "Content-Disposition": "attachment; filename=analysis.html"
-        }
-    )
+<h1>AI Analysis Report</h1>
+<pre>
+"""
+    html += json.dumps(results_json, indent=4, ensure_ascii=False)
+    html += "</pre></body></html>"
+    return html
 
 
 # ============================================================
-# HEALTH
+# API ENDPOINTS
 # ============================================================
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.post("/analyze", response_class=HTMLResponse)
+async def analyze(requirements: UploadFile = File(...)):
+    # 1. Load document
+    text = load_document(requirements)
+
+    if not text.strip():
+        return HTMLResponse("<h1>Error: Empty or unreadable document</h1>", status_code=400)
+
+    # 2. Split into 20k blocks
+    blocks = split_into_blocks(text)
+
+    results = {"blocks": []}
+
+    # 3. GPT analysis per block
+    for i, block in enumerate(blocks, start=1):
+        block_result = analyze_block(block, i)
+        results["blocks"].append(block_result)
+
+    # 4. Generate final HTML
+    html = generate_html(results)
+
+    return HTMLResponse(content=html, media_type="text/html")
+
+
+@app.get("/")
+def root():
+    return {"message": "AI Iepirkumi API is running."}
