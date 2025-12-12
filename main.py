@@ -13,7 +13,7 @@ from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer – Variant A Chunk Safe")
+app = FastAPI(title="AI Tender Analyzer – Chunk Safe v2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,27 +67,29 @@ def read_candidate_folder_recursive(folder_path: str) -> str:
             text += extract_any_file_text(file_path)
     return text
 
+
 # ======================================================
-# SAFE CHUNKING LOGIC (token limit fix)
+# SAFE CHUNKING (Fix for RateLimit - 30000 TPM)
 # ======================================================
 
-def chunk_text(text: str, max_chars: int = 10000) -> List[str]:
+def chunk_text(text: str, max_chars: int = 8000) -> List[str]:
     chunks = []
     while len(text) > max_chars:
-        part = text[:max_chars]
-        chunks.append(part)
+        chunks.append(text[:max_chars])
         text = text[max_chars:]
     chunks.append(text)
     return chunks
 
+
 # ======================================================
-# GPT-4o ANALYSIS (SAFE FOR LARGE INPUTS)
+# AI ANALYSIS (New API message.content syntax)
 # ======================================================
 
 def ai_compare(requirements_text: str, candidate_text: str) -> str:
-    chunks = chunk_text(candidate_text, max_chars=8000)  # safe for GPT-4o
+    chunks = chunk_text(candidate_text, max_chars=8000)
     partial_results = []
 
+    # ----- PHASE 1: Evaluate each chunk -----
     for i, chunk in enumerate(chunks):
         prompt = f"""
 You are a senior procurement evaluator.
@@ -103,10 +105,11 @@ REQUIREMENTS:
 {requirements_text}
 
 Return:
-1. Findings summary
-2. Potential risks
-3. Compliance notes
-Only the text, no formatting.
+- Key findings
+- Strengths
+- Weaknesses
+- Compliance deviations
+Only plain text.
 """
 
         response = client.chat.completions.create(
@@ -115,22 +118,22 @@ Only the text, no formatting.
             temperature=0.2,
         )
 
-        partial_results.append(response.choices[0].message["content"])
+        partial_results.append(response.choices[0].message.content)
 
-    # Now combine partial results
+    # ----- PHASE 2: Merge all partial results into final summary -----
+
     final_prompt = f"""
-Combine the following partial evaluation notes into one final professional tender evaluation.
+Combine the following partial evaluation notes into ONE final tender evaluation.
 
 NOTES:
 {partial_results}
 
-Return:
-
+Return clearly:
 1. Score (0–100)
 2. Strengths
 3. Weaknesses
-4. Risk level
-5. Final PASS/FAIL
+4. Legal/compliance risk level (LOW / MEDIUM / HIGH)
+5. Final verdict (PASS or FAIL)
 """
 
     summary = client.chat.completions.create(
@@ -139,10 +142,11 @@ Return:
         temperature=0.2,
     )
 
-    return summary.choices[0].message["content"]
+    return summary.choices[0].message.content
+
 
 # ======================================================
-# API ENDPOINT
+# MAIN ENDPOINT
 # ======================================================
 
 @app.post("/analyze", response_class=HTMLResponse)
@@ -179,9 +183,12 @@ async def analyze(requirements: UploadFile = File(...),
         candidate_text = read_candidate_folder_recursive(folder_path)
         ai_result = ai_compare(requirements_text, candidate_text)
 
-        results.append({"name": folder, "analysis": ai_result})
+        results.append({
+            "name": folder,
+            "analysis": ai_result
+        })
 
-    # HTML output
+    # HTML build
     html = """
     <html><head>
     <style>
@@ -189,6 +196,7 @@ async def analyze(requirements: UploadFile = File(...),
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 10px; border: 1px solid #ccc; }
     th { background: #eee; }
+    pre { white-space: pre-wrap; }
     </style>
     </head><body>
     <h2>Tender Analysis Result</h2>
@@ -202,6 +210,7 @@ async def analyze(requirements: UploadFile = File(...),
 
     shutil.rmtree(temp_dir)
     return HTMLResponse(content=html)
+
 
 @app.get("/")
 def home():
