@@ -1,180 +1,210 @@
 import os
-import json
-import tempfile
 import zipfile
+import tempfile
+import shutil
 from typing import List, Dict
 
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-from PyPDF2 import PdfReader
-from docx import Document
+import PyPDF2
+import docx
 from openai import OpenAI
-
-
-app = FastAPI(title="AI Iepirkumi – Document Analyzer", version="2.0")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+app = FastAPI(title="AI Tender Analyzer – Variant A")
 
-# ============================================================
-# FAILU NOLASĪŠANA
-# ============================================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def read_pdf(file_path: str) -> str:
+# ===============================
+#  FAILU NOLASĪŠANAS FUNKCIJAS
+# ===============================
+
+def extract_text_from_pdf(path: str) -> str:
     try:
-        reader = PdfReader(file_path)
+        reader = PyPDF2.PdfReader(path)
         text = ""
         for page in reader.pages:
             text += page.extract_text() or ""
         return text
-    except Exception:
+    except:
         return ""
 
 
-def read_docx(file_path: str) -> str:
+def extract_text_from_docx(path: str) -> str:
     try:
-        doc = Document(file_path)
+        doc = docx.Document(path)
         return "\n".join([p.text for p in doc.paragraphs])
-    except Exception:
+    except:
         return ""
 
 
-def read_txt(file_path: str) -> str:
-    try:
-        return open(file_path, "r", encoding="utf-8", errors="ignore").read()
-    except Exception:
-        return ""
+def extract_any_file_text(path: str) -> str:
+    ext = path.lower()
 
+    if ext.endswith(".pdf"):
+        return extract_text_from_pdf(path)
 
-def read_zip(file_path: str) -> str:
-    text = ""
-    with zipfile.ZipFile(file_path, "r") as z:
-        for name in z.namelist():
-            with z.open(name) as f:
-                try:
-                    content = f.read().decode("utf-8", errors="ignore")
-                    text += "\n\n===== FILE: " + name + " =====\n\n"
-                    text += content
-                except Exception:
-                    pass
-    return text
+    if ext.endswith(".docx"):
+        return extract_text_from_docx(path)
 
+    if ext.endswith(".txt") or ext.endswith(".md") or ext.endswith(".rtf"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except:
+            return ""
 
-def load_document(file: UploadFile) -> str:
-    suffix = file.filename.lower()
-
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(file.file.read())
-        tmp_path = tmp.name
-
-    if suffix.endswith(".pdf"):
-        return read_pdf(tmp_path)
-
-    if suffix.endswith(".docx"):
-        return read_docx(tmp_path)
-
-    if suffix.endswith(".txt"):
-        return read_txt(tmp_path)
-
-    if suffix.endswith(".zip") or suffix.endswith(".edoc"):
-        return read_zip(tmp_path)
-
+    # Ignorē Word .doc, Excel .xlsx, CSV u.c. nesteidzoties
     return ""
 
 
-# ============================================================
-# BLOKU SADALĪŠANA — 20 000 rakstzīmes
-# ============================================================
+def read_candidate_folder_recursive(folder_path: str) -> str:
+    full_text = ""
 
-def split_into_blocks(text: str, block_size: int = 20000) -> List[str]:
-    return [text[i:i + block_size] for i in range(0, len(text), block_size)]
+    for root, dirs, files in os.walk(folder_path):
+        for f in files:
+            file_path = os.path.join(root, f)
+            full_text += f"\n\n===== FILE: {f} =====\n\n"
+            full_text += extract_any_file_text(file_path)
+
+    return full_text
 
 
-# ============================================================
-# GPT ANALĪZE
-# ============================================================
+# ===============================
+#   AI ANALĪZE
+# ===============================
 
-def analyze_block(block_text: str, block_number: int) -> Dict:
+def ai_compare(requirements_text: str, candidate_text: str) -> str:
     prompt = f"""
-You are an AI tender analysis engine.
+You are a senior procurement evaluator.
 
-Analyze the following document block #{block_number}.
-Extract:
-- Requirements
-- Criteria
-- Constraints
-- Expected deliverables
-- Anything relevant as input for procurement evaluation.
+Compare candidate documents with REQUIREMENTS.
 
-Return structured JSON.
+Provide:
+1. Score (0–100)
+2. Strengths
+3. Weaknesses
+4. Risk level
+5. Final verdict (PASS/FAIL)
 
-BLOCK CONTENT:
-{block_text}
+REQUIREMENTS:
+{requirements_text}
+
+CANDIDATE:
+{candidate_text}
+
+Return only clean formatted text.
 """
 
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model="gpt-4o",
-        input=prompt,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
     )
 
-    try:
-        data = json.loads(response.output[0].content[0].text)
-        return data
-    except Exception:
-        return {"block": block_number, "raw_text": response.output[0].content[0].text}
+    return response.choices[0].message["content"]
 
 
-# ============================================================
-# HTML IZVEIDE
-# ============================================================
-
-def generate_html(results_json: Dict) -> str:
-    html = """
-<html>
-<head>
-<style>
-body { font-family: Arial; padding: 20px; }
-pre { background: #f0f0f0; padding: 15px; border-radius: 5px; white-space: pre-wrap; }
-</style>
-</head>
-<body>
-<h1>AI Analysis Report</h1>
-<pre>
-"""
-    html += json.dumps(results_json, indent=4, ensure_ascii=False)
-    html += "</pre></body></html>"
-    return html
-
-
-# ============================================================
-# API ENDPOINTS
-# ============================================================
+# ===============================
+#       API ENDPOINT
+# ===============================
 
 @app.post("/analyze", response_class=HTMLResponse)
-async def analyze(requirements: UploadFile = File(...)):
-    # 1. Load document
-    text = load_document(requirements)
+async def analyze(
+    requirements: UploadFile = File(...),
+    zip_candidates: UploadFile = File(...)
+):
+    temp_dir = tempfile.mkdtemp()
 
-    if not text.strip():
-        return HTMLResponse("<h1>Error: Empty or unreadable document</h1>", status_code=400)
+    # ------------------------------
+    # 1) LASĀM PRASĪBU DOKUMENTU
+    # ------------------------------
+    req_path = os.path.join(temp_dir, requirements.filename)
+    with open(req_path, "wb") as f:
+        f.write(await requirements.read())
 
-    # 2. Split into 20k blocks
-    blocks = split_into_blocks(text)
+    requirements_text = extract_any_file_text(req_path)
 
-    results = {"blocks": []}
+    # ------------------------------
+    # 2) IZPAKOJAM KANDIDĀTU ZIP
+    # ------------------------------
+    zip_path = os.path.join(temp_dir, zip_candidates.filename)
+    with open(zip_path, "wb") as f:
+        f.write(await zip_candidates.read())
 
-    # 3. GPT analysis per block
-    for i, block in enumerate(blocks, start=1):
-        block_result = analyze_block(block, i)
-        results["blocks"].append(block_result)
+    extract_path = os.path.join(temp_dir, "unzipped")
+    os.makedirs(extract_path, exist_ok=True)
 
-    # 4. Generate final HTML
-    html = generate_html(results)
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(extract_path)
 
-    return HTMLResponse(content=html, media_type="text/html")
+    # ------------------------------
+    # 3) APSTRĀDĀM KANDIDĀTUS (REKURSIJA)
+    # ------------------------------
+    results = []
 
+    for folder in os.listdir(extract_path):
+        folder_path = os.path.join(extract_path, folder)
+        if not os.path.isdir(folder_path):
+            continue
+
+        candidate_text = read_candidate_folder_recursive(folder_path)
+        ai_result = ai_compare(requirements_text, candidate_text)
+
+        results.append({
+            "name": folder,
+            "analysis": ai_result
+        })
+
+    # ------------------------------
+    # 4) HTML TABULA
+    # ------------------------------
+
+    html = """
+    <html>
+    <head>
+        <title>AI Tender Analyzer</title>
+        <style>
+            body { font-family: Arial; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; }
+            td, th { border: 1px solid #ccc; padding: 10px; vertical-align: top; }
+            th { background: #eee; }
+            .name { font-weight: bold; font-size: 18px; }
+        </style>
+    </head>
+    <body>
+    <h2>Tender Analysis Result</h2>
+    <table>
+        <tr><th>Candidate</th><th>AI Evaluation</th></tr>
+    """
+
+    for r in results:
+        html += f"""
+        <tr>
+            <td class="name">{r['name']}</td>
+            <td><pre>{r['analysis']}</pre></td>
+        </tr>
+        """
+
+    html += "</table></body></html>"
+
+    shutil.rmtree(temp_dir)
+    return HTMLResponse(content=html)
+
+
+# ===============================
+#   ROOT ENDPOINT
+# ===============================
 
 @app.get("/")
-def root():
-    return {"message": "AI Iepirkumi API is running."}
+def home():
+    return {"status": "AI Tender Analyzer Running"}
