@@ -3,16 +3,17 @@ import tempfile
 import zipfile
 import datetime
 from pathlib import Path
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
 from openai import OpenAI
-from pdfminer.high_level import extract_text
 from docx import Document
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer", version="2.0")
+app = FastAPI(title="AI Tender Analyzer – No-PDFMiner Version")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,27 +22,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===========================
+
+# =======================
 # HELPERS
-# ===========================
+# =======================
 
 def clean(text):
-    if not text:
-        return ""
-    return text.replace("\x00", "").strip()
+    return text.replace("\x00", "").strip() if text else ""
 
-def extract_pdf(path):
-    try:
-        return clean(extract_text(path))
-    except:
-        return ""
 
 def extract_docx(path):
     try:
         doc = Document(path)
-        return "\n".join([p.text for p in doc.paragraphs])
+        return "\n".join(p.text for p in doc.paragraphs)
     except:
         return ""
+
 
 def extract_edoc(path):
     text = ""
@@ -49,10 +45,14 @@ def extract_edoc(path):
         with zipfile.ZipFile(path, "r") as z:
             for name in z.namelist():
                 if name.lower().endswith((".xml", ".txt")):
-                    text += clean(z.read(name).decode(errors="ignore"))
+                    try:
+                        text += clean(z.read(name).decode(errors="ignore"))
+                    except:
+                        pass
     except:
         pass
     return text
+
 
 def extract_zip(path):
     results = {}
@@ -62,39 +62,62 @@ def extract_zip(path):
             if name.endswith("/"):
                 continue
 
+            ext = name.lower()
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp.write(z.read(name))
                 tmp_path = tmp.name
 
-            if name.lower().endswith(".pdf"):
-                results[name] = extract_pdf(tmp_path)
-
-            elif name.lower().endswith(".docx"):
+            if ext.endswith(".docx"):
                 results[name] = extract_docx(tmp_path)
 
-            elif name.lower().endswith(".edoc"):
+            elif ext.endswith(".edoc"):
                 results[name] = extract_edoc(tmp_path)
 
-            elif name.lower().endswith(".txt"):
+            elif ext.endswith(".txt"):
                 try:
                     results[name] = clean(z.read(name).decode(errors="ignore"))
                 except:
                     results[name] = ""
+
+            elif ext.endswith(".pdf"):
+                # PDF → Vision OCR
+                with open(tmp_path, "rb") as f:
+                    pdf_bytes = f.read()
+
+                vision_response = client.responses.create(
+                    model="gpt-4o-mini",
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text",
+                                 "text": "Extract all text from this PDF file."},
+                                {
+                                    "type": "input_file",
+                                    "mime_type": "application/pdf",
+                                    "data": pdf_bytes
+                                }
+                            ]
+                        }
+                    ]
+                )
+
+                results[name] = vision_response.output_text
 
             os.unlink(tmp_path)
 
     return results
 
 
-# ======================================
-#   GPT FUNCTIONS
-# ======================================
+# =======================
+# GPT PROCESSING
+# =======================
 
 def ai_extract_requirements(text):
     prompt = f"""
-Izvelc VISAS prasības no dokumenta. Saglabā secību.
-Formāts:
+Izvelc VISAS prasības no dokumenta, saglabājot struktūru.
 
+Formāts:
 [
   {{
     "prasība": "...",
@@ -105,30 +128,24 @@ Formāts:
 Dokuments:
 {text}
 """
-
-    resp = client.responses.create(
-        model="gpt-4o",
-        input=prompt
-    )
-
-    return resp.output_text
+    r = client.responses.create(model="gpt-4o", input=prompt)
+    return r.output_text
 
 
-def ai_compare(req_json, candidate_text):
+def ai_compare(req_json, cand_text):
     prompt = f"""
-Salīdzini prasības ar kandidāta dokumentiem.
+Salīdzini katru prasību ar kandidāta dokumentu saturu.
 
-Katru prasību izvērtē:
+Statusi:
 - Atbilst
 - Daļēji atbilst
 - Neatbilst
 
 Formāts:
-
 [
   {{
     "prasība": "...",
-    "statuss": "Atbilst / Daļēji atbilst / Neatbilst",
+    "statuss": "...",
     "pamatojums": "..."
   }}
 ]
@@ -137,83 +154,96 @@ Prasības:
 {req_json}
 
 Kandidāta dokumenti:
-{candidate_text}
+{cand_text}
 """
-
-    resp = client.responses.create(
-        model="gpt-4o",
-        input=prompt
-    )
-
-    return resp.output_text
+    r = client.responses.create(model="gpt-4o", input=prompt)
+    return r.output_text
 
 
-# ======================================
-#   HTML BUILDER
-# ======================================
+# =======================
+# HTML OUTPUT
+# =======================
 
-def build_html(requirements, comparisons, filename):
-    html = f"""
-<html><head>
-<meta charset='UTF-8'>
+def build_html(requirements, comparisons):
+    return f"""
+<html>
+<head>
+<meta charset="UTF-8">
 <style>
 body {{ font-family: Arial; padding: 20px; }}
-.req {{ margin-bottom: 20px; padding: 10px; border:1px solid #ccc; }}
 pre {{ white-space: pre-wrap; }}
 </style>
-</head><body>
+</head>
+<body>
 
 <h1>Tendera analīzes atskaite</h1>
-<p><b>Faila nosaukums:</b> {filename}</p>
 
-<h2>Prasību saraksts</h2>
+<h2>Prasības</h2>
 <pre>{requirements}</pre>
 
-<h2>Kandidāta salīdzināšana</h2>
+<h2>Kandidātu salīdzinājums</h2>
 <pre>{comparisons}</pre>
 
-</body></html>
+</body>
+</html>
 """
-    return html
 
 
-# ======================================
-#              ENDPOINT
-# ======================================
+# =======================
+# API ENDPOINT
+# =======================
 
 @app.post("/analyze")
 async def analyze(requirements: list[UploadFile] = File(...),
                   candidates: list[UploadFile] = File(...)):
 
-    # 1) Read requirements
     req_text = ""
 
+    # =======================
+    # Load requirements
+    # =======================
     for f in requirements:
         tmp = tempfile.NamedTemporaryFile(delete=False)
         tmp.write(await f.read())
         tmp.close()
 
-        name = f.filename.lower()
+        ext = f.filename.lower()
 
-        if name.endswith(".pdf"):
-            req_text += extract_pdf(tmp.name)
-        elif name.endswith(".docx"):
+        if ext.endswith(".docx"):
             req_text += extract_docx(tmp.name)
-        elif name.endswith(".edoc"):
+        elif ext.endswith(".edoc"):
             req_text += extract_edoc(tmp.name)
-        elif name.endswith(".zip"):
-            parts = extract_zip(tmp.name)
-            for t in parts.values():
+        elif ext.endswith(".zip"):
+            for t in extract_zip(tmp.name).values():
                 req_text += t
+        elif ext.endswith(".pdf"):
+            with open(tmp.name, "rb") as pdf:
+                pdf_bytes = pdf.read()
+
+            vr = client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Extract all text from this PDF."},
+                            {"type": "input_file", "mime_type": "application/pdf", "data": pdf_bytes}
+                        ]
+                    }
+                ]
+            )
+            req_text += vr.output_text
 
         os.unlink(tmp.name)
 
     if not req_text.strip():
-        raise HTTPException(400, "Prasību dokumentu nevarēja nolasīt.")
+        raise HTTPException(400, "Neizdevās nolasīt prasību dokumentu.")
 
     req_structured = ai_extract_requirements(req_text)
 
-    # 2) Candidate evaluation
+    # =======================
+    # Load candidates
+    # =======================
     final_comp = ""
 
     for f in candidates:
@@ -228,11 +258,13 @@ async def analyze(requirements: list[UploadFile] = File(...),
         comp = ai_compare(req_structured, cand_text)
         final_comp += f"\n\n=== {f.filename} ===\n{comp}"
 
-    # 3) Produce HTML report
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"/tmp/report_{timestamp}.html"
+    # =======================
+    # Output HTML
+    # =======================
+    t = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"/tmp/report_{t}.html"
 
-    html = build_html(req_structured, final_comp, "Tender Analysis")
+    html = build_html(req_structured, final_comp)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
 
