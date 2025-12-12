@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-python-docx
-PyPDF2
-mammoth
-openai>=1.0.0
 python-multipart
-pdfminer
+requests
+pdfminer.six==20231228
+openai
