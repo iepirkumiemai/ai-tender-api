@@ -1,139 +1,278 @@
 import os
-import zipfile
 import tempfile
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse
+import zipfile
+import datetime
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+import mammoth
+from pdfminer.high_level import extract_text
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI(title="AI Tender Analyzer", version="1.0")
 
-# ===========================================================
-# Palīgfunkcija – lasa PDF, DOCX, TXT kā tekstu
-# ===========================================================
-import docx
-from PyPDF2 import PdfReader
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def extract_text_from_file(path: str) -> str:
-    ext = path.lower()
+# ---------------------------------------------------------
+#               HELPERS: FILE EXTRACTION
+# ---------------------------------------------------------
 
-    if ext.endswith(".txt"):
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
+def clean(text):
+    if not text:
+        return ""
+    return text.replace("\x00", "").strip()
 
-    if ext.endswith(".docx"):
-        doc = docx.Document(path)
-        return "\n".join([p.text for p in doc.paragraphs])
+def extract_pdf(path: str) -> str:
+    try:
+        return clean(extract_text(path))
+    except:
+        return ""
 
-    if ext.endswith(".pdf"):
-        reader = PdfReader(path)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-        return text
+def extract_docx(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            result = mammoth.extract_raw_text(f)
+            return clean(result.value)
+    except:
+        return ""
 
-    return ""
+def extract_edoc(path: str) -> str:
+    text = ""
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for name in z.namelist():
+                if name.lower().endswith((".xml", ".txt")):
+                    text += clean(z.read(name).decode(errors="ignore"))
+    except:
+        pass
+    return text
+
+def extract_zip(path: str) -> dict:
+    """
+    Returns {filename: extracted_text}
+    """
+    results = {}
+
+    with zipfile.ZipFile(path, "r") as z:
+        for name in z.namelist():
+
+            if name.endswith("/"):
+                continue
+
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(z.read(name))
+                tmp_path = tmp.name
+
+            if name.lower().endswith(".pdf"):
+                results[name] = extract_pdf(tmp_path)
+
+            elif name.lower().endswith(".docx"):
+                results[name] = extract_docx(tmp_path)
+
+            elif name.lower().endswith(".edoc"):
+                results[name] = extract_edoc(tmp_path)
+
+            elif name.lower().endswith(".txt"):
+                try:
+                    results[name] = clean(z.read(name).decode(errors="ignore"))
+                except:
+                    results[name] = ""
+
+            os.unlink(tmp_path)
+
+    return results
 
 
-# ===========================================================
-# AI analīze (latviešu valodā)
-# ===========================================================
-def analyze_document(requirements_text: str, candidate_text: str) -> str:
+# ---------------------------------------------------------
+#            GPT-4o: REQUIREMENTS EXTRACTION
+# ---------------------------------------------------------
+
+def ai_extract_requirements(text: str) -> list:
     prompt = f"""
-Tu esi publisko iepirkumu eksperts Latvijā ar 15 gadu pieredzi.
-Salīdzini iesniegto kandidāta dokumentu ar prasību dokumentu.
-
-ATBILDI TIKAI LATVIEŠU VALODĀ.
-
+Izanalizē turpmāko iepirkuma prasību tekstu un izvelc VISAS prasības tādā secībā,
+kādā tās parādās dokumentā. Neizdomā nekādas kategorijas.
 Struktūra:
 
-1) **Kopsavilkums** – 5–7 teikumi.
-2) **Stiprās puses** – punkti.
-3) **Vājās puses** – punkti.
-4) **Atbilstības risks** – Zems / Vidējs / Augsts + pamatojums.
-5) **Gala vērtējums** – Atbilst / Daļēji atbilst / Neatbilst.
+[
+  {{
+    "prasība": "...",
+    "pamatojums": "..."
+  }}
+]
 
-Prasību dokuments:
--------------------
-{requirements_text}
+TEKSTS:
+{text}
+"""
 
-Kandidāta dokuments:
----------------------
+    resp = client.responses.create(
+        model="gpt-4o",
+        input=prompt
+    )
+
+    return resp.output_text
+
+
+# ---------------------------------------------------------
+#        GPT-4o: REQUIREMENT vs DOCUMENT COMPARISON
+# ---------------------------------------------------------
+
+def ai_compare(req_json: str, candidate_text: str) -> str:
+    prompt = f"""
+Salīdzini prasības ar kandidāta dokumentiem.
+Katru prasību izvērtē:
+
+- "Atbilst"
+- "Daļēji atbilst"
+- "Neatbilst"
+
+SEMANTISKAIS PAMATOJUMS obligāts. Formatēšana:
+
+[
+  {{
+    "prasība": "...",
+    "statuss": "Atbilst/Daļēji atbilst/Neatbilst",
+    "pamatojums": "..."
+  }}
+]
+
+PRASĪBAS JSON:
+{req_json}
+
+KANDIDĀTA DOKUMENTU TEKSTS:
 {candidate_text}
 """
 
-    response = client.chat.completions.create(
+    resp = client.responses.create(
         model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Tu esi publisko iepirkumu eksperts."},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=5000,
-        temperature=0.2,
+        input=prompt
     )
 
-    return response.choices[0].message.content
+    return resp.output_text
 
 
-# ===========================================================
-# API: /analyze
-# ===========================================================
+# ---------------------------------------------------------
+#              HTML REPORT GENERATION
+# ---------------------------------------------------------
+
+def build_html(requirements, comparisons, filename):
+    html = """
+<html><head>
+<meta charset='UTF-8'>
+<style>
+body { font-family: Arial; padding: 20px; }
+h1 { color: #333; }
+h2 { margin-top: 30px; }
+.req-block { margin-bottom: 20px; padding: 10px; border:1px solid #ccc; border-radius:6px;}
+.status-green { color: green; font-weight: bold; }
+.status-yellow { color: orange; font-weight: bold; }
+.status-red { color: red; font-weight: bold; }
+pre { white-space: pre-wrap; }
+</style>
+</head><body>
+
+<h1>Tendera analīzes atskaite</h1>
+<p><b>Faila nosaukums:</b> """ + filename + "</p>"
+
+    html += "<h2>Prasību saraksts</h2><pre>" + requirements + "</pre>"
+    html += "<h2>Kandidāta salīdzināšana</h2><pre>" + comparisons + "</pre>"
+    html += "</body></html>"
+
+    return html
+
+
+# ---------------------------------------------------------
+#                    MAIN ENDPOINT
+# ---------------------------------------------------------
+
 @app.post("/analyze")
-async def analyze(
-    requirements: UploadFile = File(...),
-    candidates_zip: UploadFile = File(...)
-):
-    # 1. Nolasām prasību dokumentu
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_req:
-        tmp_req.write(await requirements.read())
-        tmp_req_path = tmp_req.name
+async def analyze(requirements: list[UploadFile] = File(...),
+                  candidates: list[UploadFile] = File(...)):
+    # -------------------------------
+    # 1) READ REQUIREMENTS
+    # -------------------------------
+    full_requirements_text = ""
 
-    requirements_text = extract_text_from_file(tmp_req_path)
+    for f in requirements:
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(await f.read())
+        tmp.close()
 
-    # 2. Atveram ZIP ar kandidātu dokumentiem
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "candidates.zip")
-        with open(zip_path, "wb") as f:
-            f.write(await candidates_zip.read())
+        name = f.filename.lower()
 
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(tmpdir)
+        if name.endswith(".pdf"):
+            full_requirements_text += extract_pdf(tmp.name)
+        elif name.endswith(".docx"):
+            full_requirements_text += extract_docx(tmp.name)
+        elif name.endswith(".edoc"):
+            full_requirements_text += extract_edoc(tmp.name)
+        elif name.endswith(".zip"):
+            texts = extract_zip(tmp.name)
+            for _, t in texts.items():
+                full_requirements_text += t
 
-        results_html = """
-        <html><head>
-        <style>
-        body { font-family: Arial; padding: 20px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 10px; border: 1px solid #ccc; vertical-align: top; }
-        th { background: #f0f0f0; }
-        pre { white-space: pre-wrap; font-family: Arial; }
-        </style>
-        </head><body>
-        <h2>Iepirkuma kandidātu analīzes rezultāti</h2>
-        <table>
-        <tr><th>Dokuments</th><th>Analīze</th></tr>
-        """
+        os.unlink(tmp.name)
 
-        # 3. Apstrādājam katru failu ZIP iekšā
-        for root, _, files in os.walk(tmpdir):
-            for filename in files:
-                if filename.endswith((".pdf", ".docx", ".txt")):
-                    full_path = os.path.join(root, filename)
-                    candidate_text = extract_text_from_file(full_path)
+    if not full_requirements_text.strip():
+        raise HTTPException(400, "Neizdevās nolasīt prasību failu saturu.")
 
-                    if len(candidate_text.strip()) < 20:
-                        analysis = "(Nevarēja nolasīt tekstu – iespējams skenēts PDF.)"
-                    else:
-                        analysis = analyze_document(requirements_text, candidate_text)
+    # 2) GPT: extract requirements
+    req_structured = ai_extract_requirements(full_requirements_text)
 
-                    results_html += f"""
-                    <tr>
-                        <td>{filename}</td>
-                        <td><pre>{analysis}</pre></td>
-                    </tr>
-                    """
+    # -------------------------------
+    # 3) READ CANDIDATES
+    # -------------------------------
+    final_comparison = ""
 
-        results_html += "</table></body></html>"
+    for f in candidates:
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(await f.read())
+        tmp.close()
 
-    return HTMLResponse(content=results_html)
+        name = f.filename
+        extracted = extract_zip(tmp.name)
+
+        cand_text = "\n\n".join(extracted.values())
+
+        os.unlink(tmp.name)
+
+        if not cand_text.strip():
+            final_comparison += f"\n\nDokuments {name}: tukšs vai nenolasāms."
+            continue
+
+        comp = ai_compare(req_structured, cand_text)
+        final_comparison += f"\n\n=== {name} ===\n" + comp
+
+    # -------------------------------
+    # 4) HTML REPORT
+    # -------------------------------
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = f"/tmp/report_{timestamp}.html"
+
+    html = build_html(req_structured, final_comparison, "Tender Analysis")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    url = f"/download/{Path(report_path).name}"
+
+    return {"status": "ok", "report_url": url}
+
+
+# ---------------------------------------------------------
+#       FILE DOWNLOAD ENDPOINT
+# ---------------------------------------------------------
+
+@app.get("/download/{filename}")
+async def download(filename: str):
+    path = f"/tmp/{filename}"
+    if not os.path.exists(path):
+        raise HTTPException(404, "Fails nav atrasts")
+    return FileResponse(path, media_type="text/html")
