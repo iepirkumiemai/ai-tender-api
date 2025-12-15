@@ -1,26 +1,29 @@
 import os
-import tempfile
 import zipfile
+import tempfile
 import datetime
-import base64
 from pathlib import Path
+from typing import List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from openai import OpenAI
 from docx import Document
-from pdf2image import convert_from_path
-from PIL import Image
+from openai import OpenAI
+
 
 # =======================
-# INIT
+# CONFIG
 # =======================
+
+MAX_FILE_SIZE_MB = 25          # drošs limits vienam failam
+MAX_ZIP_FILES = 50             # cik failus max apstrādā ZIPā
+VISION_MODEL = "gpt-4o-mini"   # stabils Vision OCR
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer – Stable Vision Pipeline")
+app = FastAPI(title="AI Tender Analyzer – C Variant (Stable)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,14 +33,18 @@ app.add_middleware(
 )
 
 # =======================
-# TEXT EXTRACTORS
+# HELPERS
 # =======================
 
-def clean(text: str) -> str:
-    return text.replace("\x00", "").strip() if text else ""
+def check_size(file: UploadFile):
+    if file.size and file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(
+            413,
+            f"Fails '{file.filename}' ir par lielu (>{MAX_FILE_SIZE_MB} MB)"
+        )
 
 
-def extract_docx(path: str) -> str:
+def extract_docx_text(path: str) -> str:
     try:
         doc = Document(path)
         return "\n".join(p.text for p in doc.paragraphs)
@@ -45,115 +52,60 @@ def extract_docx(path: str) -> str:
         return ""
 
 
-def extract_edoc(path: str) -> str:
-    text = ""
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if name.lower().endswith((".xml", ".txt")):
-                    try:
-                        text += clean(z.read(name).decode(errors="ignore"))
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return text
-
-
-# =======================
-# VISION OCR (PDF → TEXT)
-# =======================
-
-def vision_ocr_pdf(pdf_path: str) -> str:
+def vision_extract_pdf(path: str) -> str:
     """
-    STABILA Vision OCR:
-    - PDF → images
-    - images → GPT-4o Vision
-    - nekad nemet exception
+    VIENĪGA vieta, kur izmantojam Vision.
+    PDF tiek sūtīts kā input_file (pareizais veids).
     """
-
     try:
-        images = convert_from_path(pdf_path, dpi=200)
-    except Exception:
-        return ""
-
-    if not images:
-        return ""
-
-    text = ""
-    CHUNK = 6
-
-    for i in range(0, len(images), CHUNK):
-        batch = images[i:i + CHUNK]
-
-        content = [{
-            "type": "input_text",
-            "text": f"""
-You are an expert OCR engine for legal and tender documents.
-
-Extract ALL text exactly as it appears.
-Preserve:
-- headings
-- tables (Markdown)
-- lists
-- numbering
-- layout
-
-Rules:
-- Do NOT summarize
-- Do NOT omit text
-- Mark unclear parts as [unclear]
-
-Pages {i+1}-{i+len(batch)}.
-Output Markdown only.
-"""
-        }]
-
-        for img in batch:
-            buf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            img.save(buf.name)
-            with open(buf.name, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            os.unlink(buf.name)
-
-            content.append({
-                "type": "input_image",
-                "image_url": {
-                    "url": f"data:image/png;base64,{b64}",
-                    "detail": "high"
-                }
-            })
-
-        try:
-            r = client.responses.create(
-                model="gpt-4o",
-                input=[{"role": "user", "content": content}],
+        with open(path, "rb") as f:
+            response = client.responses.create(
+                model=VISION_MODEL,
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Extract ALL readable text from this PDF document. "
+                                "Preserve structure, lists and tables. "
+                                "Do NOT summarize or omit anything."
+                            )
+                        },
+                        {
+                            "type": "input_file",
+                            "mime_type": "application/pdf",
+                            "data": f.read()
+                        }
+                    ]
+                }],
                 max_output_tokens=4096
             )
-            text += r.output_text or ""
-        except Exception:
-            continue
-
-    return text
-
-
-# =======================
-# ZIP HANDLER
-# =======================
-
-def extract_zip(path: str) -> list[tuple[str, bytes]]:
-    files = []
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            for name in z.namelist():
-                if not name.endswith("/"):
-                    try:
-                        files.append((name, z.read(name)))
-                    except Exception:
-                        pass
+        return response.output_text or ""
     except Exception:
-        pass
-    return files
+        return ""
+
+
+def extract_zip_files(path: str) -> List[str]:
+    """
+    Atgriež TEMP failu ceļus (PDF / DOCX)
+    """
+    extracted_paths = []
+
+    with zipfile.ZipFile(path, "r") as z:
+        names = [n for n in z.namelist() if not n.endswith("/")][:MAX_ZIP_FILES]
+
+        for name in names:
+            ext = name.lower()
+            if not ext.endswith((".pdf", ".docx")):
+                continue
+
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp.write(z.read(name))
+            tmp.close()
+            extracted_paths.append(tmp.name)
+
+    return extracted_paths
 
 
 # =======================
@@ -162,7 +114,7 @@ def extract_zip(path: str) -> list[tuple[str, bytes]]:
 
 def ai_extract_requirements(text: str) -> str:
     prompt = f"""
-Izvelc VISAS prasības no dokumenta, saglabājot struktūru.
+Izvelc VISAS prasības no dokumenta.
 
 Formāts:
 [
@@ -179,9 +131,9 @@ Dokuments:
     return r.output_text or ""
 
 
-def ai_compare(req_json: str, cand_text: str) -> str:
+def ai_compare(requirements_json: str, candidate_text: str) -> str:
     prompt = f"""
-Salīdzini katru prasību ar kandidāta dokumentu saturu.
+Salīdzini prasības ar kandidāta dokumentiem.
 
 Statusi:
 - Atbilst
@@ -198,10 +150,10 @@ Formāts:
 ]
 
 Prasības:
-{req_json}
+{requirements_json}
 
 Kandidāta dokumenti:
-{cand_text}
+{candidate_text}
 """
     r = client.responses.create(model="gpt-4o", input=prompt)
     return r.output_text or ""
@@ -211,7 +163,7 @@ Kandidāta dokumenti:
 # HTML
 # =======================
 
-def build_html(requirements: str, comparisons: str) -> str:
+def build_html(req: str, comp: str) -> str:
     return f"""
 <html>
 <head>
@@ -222,15 +174,13 @@ pre {{ white-space: pre-wrap; }}
 </style>
 </head>
 <body>
-
 <h1>Tendera analīzes atskaite</h1>
 
 <h2>Prasības</h2>
-<pre>{requirements}</pre>
+<pre>{req}</pre>
 
 <h2>Kandidātu salīdzinājums</h2>
-<pre>{comparisons}</pre>
-
+<pre>{comp}</pre>
 </body>
 </html>
 """
@@ -242,95 +192,82 @@ pre {{ white-space: pre-wrap; }}
 
 @app.post("/analyze")
 async def analyze(
-    requirements: list[UploadFile] = File(...),
-    candidates: list[UploadFile] = File(...)
+    requirements: List[UploadFile] = File(...),
+    candidates: List[UploadFile] = File(...)
 ):
     req_text = ""
 
-    # ---------- REQUIREMENTS ----------
+    # -------- REQUIREMENTS --------
     for f in requirements:
+        check_size(f)
         data = await f.read()
-        name = f.filename.lower()
 
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(data)
+        tmp.close()
 
-        if name.endswith(".docx"):
-            req_text += extract_docx(tmp_path)
+        try:
+            name = f.filename.lower()
 
-        elif name.endswith(".edoc"):
-            req_text += extract_edoc(tmp_path)
+            if name.endswith(".docx"):
+                req_text += extract_docx_text(tmp.name)
 
-        elif name.endswith(".pdf"):
-            req_text += vision_ocr_pdf(tmp_path)
+            elif name.endswith(".pdf"):
+                req_text += vision_extract_pdf(tmp.name)
 
-        elif name.endswith(".zip"):
-            for fn, b in extract_zip(tmp_path):
-                with tempfile.NamedTemporaryFile(delete=False) as zf:
-                    zf.write(b)
-                    zp = zf.name
-
-                if fn.lower().endswith(".docx"):
-                    req_text += extract_docx(zp)
-                elif fn.lower().endswith(".pdf"):
-                    req_text += vision_ocr_pdf(zp)
-                elif fn.lower().endswith((".txt", ".xml")):
-                    try:
-                        req_text += clean(b.decode(errors="ignore"))
-                    except Exception:
-                        pass
-
-                os.unlink(zp)
-
-        os.unlink(tmp_path)
+            elif name.endswith(".zip"):
+                for p in extract_zip_files(tmp.name):
+                    if p.endswith(".pdf"):
+                        req_text += vision_extract_pdf(p)
+                    elif p.endswith(".docx"):
+                        req_text += extract_docx_text(p)
+                    os.unlink(p)
+        finally:
+            os.unlink(tmp.name)
 
     if not req_text.strip():
         raise HTTPException(400, "Neizdevās nolasīt prasību dokumentus.")
 
     req_structured = ai_extract_requirements(req_text)
 
-    # ---------- CANDIDATES ----------
+    # -------- CANDIDATES --------
     final_comp = ""
 
     for f in candidates:
+        check_size(f)
         data = await f.read()
-        name = f.filename.lower()
+
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(data)
+        tmp.close()
+
         cand_text = ""
 
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
+        try:
+            name = f.filename.lower()
 
-        if name.endswith(".pdf"):
-            cand_text += vision_ocr_pdf(tmp_path)
+            if name.endswith(".pdf"):
+                cand_text = vision_extract_pdf(tmp.name)
 
-        elif name.endswith(".zip"):
-            for fn, b in extract_zip(tmp_path):
-                with tempfile.NamedTemporaryFile(delete=False) as zf:
-                    zf.write(b)
-                    zp = zf.name
+            elif name.endswith(".docx"):
+                cand_text = extract_docx_text(tmp.name)
 
-                if fn.lower().endswith(".pdf"):
-                    cand_text += vision_ocr_pdf(zp)
-                elif fn.lower().endswith(".docx"):
-                    cand_text += extract_docx(zp)
-                elif fn.lower().endswith((".txt", ".xml")):
-                    try:
-                        cand_text += clean(b.decode(errors="ignore"))
-                    except Exception:
-                        pass
-
-                os.unlink(zp)
-
-        os.unlink(tmp_path)
+            elif name.endswith(".zip"):
+                for p in extract_zip_files(tmp.name):
+                    if p.endswith(".pdf"):
+                        cand_text += vision_extract_pdf(p)
+                    elif p.endswith(".docx"):
+                        cand_text += extract_docx_text(p)
+                    os.unlink(p)
+        finally:
+            os.unlink(tmp.name)
 
         comp = ai_compare(req_structured, cand_text)
         final_comp += f"\n\n=== {f.filename} ===\n{comp}"
 
-    # ---------- OUTPUT ----------
-    t = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"/tmp/report_{t}.html"
+    # -------- OUTPUT --------
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"/tmp/report_{ts}.html"
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(build_html(req_structured, final_comp))
