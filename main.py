@@ -17,13 +17,13 @@ from openai import OpenAI
 # CONFIG
 # =======================
 
-MAX_FILE_SIZE_MB = 25          # drošs limits vienam failam
-MAX_ZIP_FILES = 50             # cik failus max apstrādā ZIPā
-VISION_MODEL = "gpt-4o-mini"   # stabils Vision OCR
+MAX_FILE_SIZE_MB = 50
+MAX_ZIP_FILES = 200
+VISION_MODEL = "gpt-4o"
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer – C Variant (Stable)")
+app = FastAPI(title="AI Tender Analyzer – C Variant (Production)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,12 +36,9 @@ app.add_middleware(
 # HELPERS
 # =======================
 
-def check_size(file: UploadFile):
-    if file.size and file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(
-            413,
-            f"Fails '{file.filename}' ir par lielu (>{MAX_FILE_SIZE_MB} MB)"
-        )
+def check_size(f: UploadFile):
+    if f.size and f.size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(413, f"Fails {f.filename} ir par lielu.")
 
 
 def extract_docx_text(path: str) -> str:
@@ -53,10 +50,6 @@ def extract_docx_text(path: str) -> str:
 
 
 def vision_extract_pdf(path: str) -> str:
-    """
-    VIENĪGA vieta, kur izmantojam Vision.
-    PDF tiek sūtīts kā input_file (pareizais veids).
-    """
     try:
         with open(path, "rb") as f:
             response = client.responses.create(
@@ -87,25 +80,37 @@ def vision_extract_pdf(path: str) -> str:
 
 
 def extract_zip_files(path: str) -> List[str]:
-    """
-    Atgriež TEMP failu ceļus (PDF / DOCX)
-    """
-    extracted_paths = []
+    extracted = []
 
     with zipfile.ZipFile(path, "r") as z:
         names = [n for n in z.namelist() if not n.endswith("/")][:MAX_ZIP_FILES]
 
         for name in names:
-            ext = name.lower()
-            if not ext.endswith((".pdf", ".docx")):
-                continue
-
             tmp = tempfile.NamedTemporaryFile(delete=False)
             tmp.write(z.read(name))
             tmp.close()
-            extracted_paths.append(tmp.name)
+            extracted.append(tmp.name)
 
-    return extracted_paths
+    return extracted
+
+
+def classify_candidate_files(paths: List[str]) -> dict:
+    result = {
+        "text_files": [],
+        "excel_files": [],
+        "signature_files": [],
+    }
+
+    for p in paths:
+        l = p.lower()
+        if l.endswith((".pdf", ".doc", ".docx")):
+            result["text_files"].append(p)
+        elif l.endswith((".xls", ".xlsx", ".csv")):
+            result["excel_files"].append(p)
+        elif l.endswith((".edoc", ".asice", ".p7s")):
+            result["signature_files"].append(p)
+
+    return result
 
 
 # =======================
@@ -131,14 +136,15 @@ Dokuments:
     return r.output_text or ""
 
 
-def ai_compare(requirements_json: str, candidate_text: str) -> str:
+def ai_compare(req_json: str, cand_text: str) -> str:
     prompt = f"""
-Salīdzini prasības ar kandidāta dokumentiem.
+Salīdzini katru prasību ar kandidāta piedāvājumu.
 
 Statusi:
 - Atbilst
 - Daļēji atbilst
 - Neatbilst
+- Nav iesniegts
 
 Formāts:
 [
@@ -150,10 +156,10 @@ Formāts:
 ]
 
 Prasības:
-{requirements_json}
+{req_json}
 
-Kandidāta dokumenti:
-{candidate_text}
+Kandidāta piedāvājums:
+{cand_text}
 """
     r = client.responses.create(model="gpt-4o", input=prompt)
     return r.output_text or ""
@@ -207,26 +213,23 @@ async def analyze(
         tmp.close()
 
         try:
-            name = f.filename.lower()
-
-            if name.endswith(".docx"):
-                req_text += extract_docx_text(tmp.name)
-
-            elif name.endswith(".pdf"):
+            n = f.filename.lower()
+            if n.endswith(".pdf"):
                 req_text += vision_extract_pdf(tmp.name)
-
-            elif name.endswith(".zip"):
+            elif n.endswith((".doc", ".docx")):
+                req_text += extract_docx_text(tmp.name)
+            elif n.endswith(".zip"):
                 for p in extract_zip_files(tmp.name):
-                    if p.endswith(".pdf"):
+                    if p.lower().endswith(".pdf"):
                         req_text += vision_extract_pdf(p)
-                    elif p.endswith(".docx"):
+                    elif p.lower().endswith((".doc", ".docx")):
                         req_text += extract_docx_text(p)
                     os.unlink(p)
         finally:
             os.unlink(tmp.name)
 
     if not req_text.strip():
-        raise HTTPException(400, "Neizdevās nolasīt prasību dokumentus.")
+        raise HTTPException(400, "Nav izdevies nolasīt prasību dokumentus.")
 
     req_structured = ai_extract_requirements(req_text)
 
@@ -244,23 +247,28 @@ async def analyze(
         cand_text = ""
 
         try:
-            name = f.filename.lower()
+            files = extract_zip_files(tmp.name) if f.filename.lower().endswith(".zip") else [tmp.name]
+            classified = classify_candidate_files(files)
 
-            if name.endswith(".pdf"):
-                cand_text = vision_extract_pdf(tmp.name)
+            # Teksts
+            for p in classified["text_files"]:
+                if p.lower().endswith(".pdf"):
+                    cand_text += vision_extract_pdf(p)
+                else:
+                    cand_text += extract_docx_text(p)
 
-            elif name.endswith(".docx"):
-                cand_text = extract_docx_text(tmp.name)
+            # Fakti
+            if classified["excel_files"]:
+                cand_text += "\n\nFinanšu pielikumi iesniegti (Excel faili)."
+            if classified["signature_files"]:
+                cand_text += "\n\nPiedāvājums ir parakstīts (EDOC / ASiC konteiners)."
 
-            elif name.endswith(".zip"):
-                for p in extract_zip_files(tmp.name):
-                    if p.endswith(".pdf"):
-                        cand_text += vision_extract_pdf(p)
-                    elif p.endswith(".docx"):
-                        cand_text += extract_docx_text(p)
-                    os.unlink(p)
         finally:
-            os.unlink(tmp.name)
+            for p in files:
+                if os.path.exists(p):
+                    os.unlink(p)
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
         comp = ai_compare(req_structured, cand_text)
         final_comp += f"\n\n=== {f.filename} ===\n{comp}"
@@ -277,6 +285,7 @@ async def analyze(
 
 @app.get("/download/{filename}")
 async def download(filename: str):
+    filename = filename.strip('"')
     path = f"/tmp/{filename}"
     if not os.path.exists(path):
         raise HTTPException(404, "Fails nav atrasts.")
