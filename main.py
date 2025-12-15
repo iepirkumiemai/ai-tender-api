@@ -11,10 +11,16 @@ from fastapi.responses import FileResponse
 
 from openai import OpenAI
 from docx import Document
+from pdf2image import convert_from_path
+from PIL import Image
+
+# =======================
+# INIT
+# =======================
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Tender Analyzer – Stable Universal Version")
+app = FastAPI(title="AI Tender Analyzer – Stable Vision Pipeline")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +30,7 @@ app.add_middleware(
 )
 
 # =======================
-# HELPERS
+# TEXT EXTRACTORS
 # =======================
 
 def clean(text: str) -> str:
@@ -35,7 +41,7 @@ def extract_docx(path: str) -> str:
     try:
         doc = Document(path)
         return "\n".join(p.text for p in doc.paragraphs)
-    except:
+    except Exception:
         return ""
 
 
@@ -47,61 +53,107 @@ def extract_edoc(path: str) -> str:
                 if name.lower().endswith((".xml", ".txt")):
                     try:
                         text += clean(z.read(name).decode(errors="ignore"))
-                    except:
+                    except Exception:
                         pass
-    except:
+    except Exception:
         pass
     return text
 
 
-def extract_zip(path: str) -> dict:
+# =======================
+# VISION OCR (PDF → TEXT)
+# =======================
+
+def vision_ocr_pdf(pdf_path: str) -> str:
     """
-    STABILA funkcija:
-    - NEKĀDA OpenAI
-    - atgriež file_name → bytes
+    STABILA Vision OCR:
+    - PDF → images
+    - images → GPT-4o Vision
+    - nekad nemet exception
     """
-    results = {}
 
-    with zipfile.ZipFile(path, "r") as z:
-        for name in z.namelist():
-            if name.endswith("/"):
-                continue
-            try:
-                results[name] = z.read(name)
-            except:
-                results[name] = b""
+    try:
+        images = convert_from_path(pdf_path, dpi=200)
+    except Exception:
+        return ""
 
-    return results
+    if not images:
+        return ""
 
+    text = ""
+    CHUNK = 6
 
-def ai_extract_text_from_binary(filename: str, data: bytes) -> str:
-    """
-    UNIVERSĀLA AI ekstrakcija:
-    PDF, skenēti dokumenti, jebkāds binārs
-    """
-    b64 = base64.b64encode(data).decode()
+    for i in range(0, len(images), CHUNK):
+        batch = images[i:i + CHUNK]
 
-    prompt = f"""
-You are an expert document analyzer.
+        content = [{
+            "type": "input_text",
+            "text": f"""
+You are an expert OCR engine for legal and tender documents.
 
-The following file is uploaded as BASE64.
-Filename: {filename}
+Extract ALL text exactly as it appears.
+Preserve:
+- headings
+- tables (Markdown)
+- lists
+- numbering
+- layout
 
-TASK:
-- Extract ALL readable text
-- Preserve structure if possible
-- Ignore signatures, noise if unreadable
+Rules:
+- Do NOT summarize
+- Do NOT omit text
+- Mark unclear parts as [unclear]
 
-BASE64 FILE:
-{b64}
+Pages {i+1}-{i+len(batch)}.
+Output Markdown only.
 """
+        }]
 
-    r = client.responses.create(
-        model="gpt-4o",
-        input=prompt
-    )
+        for img in batch:
+            buf = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            img.save(buf.name)
+            with open(buf.name, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            os.unlink(buf.name)
 
-    return r.output_text or ""
+            content.append({
+                "type": "input_image",
+                "image_url": {
+                    "url": f"data:image/png;base64,{b64}",
+                    "detail": "high"
+                }
+            })
+
+        try:
+            r = client.responses.create(
+                model="gpt-4o",
+                input=[{"role": "user", "content": content}],
+                max_output_tokens=4096
+            )
+            text += r.output_text or ""
+        except Exception:
+            continue
+
+    return text
+
+
+# =======================
+# ZIP HANDLER
+# =======================
+
+def extract_zip(path: str) -> list[tuple[str, bytes]]:
+    files = []
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for name in z.namelist():
+                if not name.endswith("/"):
+                    try:
+                        files.append((name, z.read(name)))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return files
 
 
 # =======================
@@ -124,7 +176,7 @@ Dokuments:
 {text}
 """
     r = client.responses.create(model="gpt-4o", input=prompt)
-    return r.output_text
+    return r.output_text or ""
 
 
 def ai_compare(req_json: str, cand_text: str) -> str:
@@ -152,7 +204,7 @@ Kandidāta dokumenti:
 {cand_text}
 """
     r = client.responses.create(model="gpt-4o", input=prompt)
-    return r.output_text
+    return r.output_text or ""
 
 
 # =======================
@@ -195,78 +247,95 @@ async def analyze(
 ):
     req_text = ""
 
-    # -------- REQUIREMENTS --------
+    # ---------- REQUIREMENTS ----------
     for f in requirements:
         data = await f.read()
         name = f.filename.lower()
 
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
         if name.endswith(".docx"):
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(data)
-                req_text += extract_docx(tmp.name)
-                os.unlink(tmp.name)
+            req_text += extract_docx(tmp_path)
 
         elif name.endswith(".edoc"):
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(data)
-                req_text += extract_edoc(tmp.name)
-                os.unlink(tmp.name)
+            req_text += extract_edoc(tmp_path)
+
+        elif name.endswith(".pdf"):
+            req_text += vision_ocr_pdf(tmp_path)
 
         elif name.endswith(".zip"):
-            extracted = extract_zip_from_bytes(data := data)
-            for fn, b in extracted.items():
-                req_text += ai_extract_text_from_binary(fn, b)
+            for fn, b in extract_zip(tmp_path):
+                with tempfile.NamedTemporaryFile(delete=False) as zf:
+                    zf.write(b)
+                    zp = zf.name
 
-        else:
-            req_text += ai_extract_text_from_binary(f.filename, data)
+                if fn.lower().endswith(".docx"):
+                    req_text += extract_docx(zp)
+                elif fn.lower().endswith(".pdf"):
+                    req_text += vision_ocr_pdf(zp)
+                elif fn.lower().endswith((".txt", ".xml")):
+                    try:
+                        req_text += clean(b.decode(errors="ignore"))
+                    except Exception:
+                        pass
+
+                os.unlink(zp)
+
+        os.unlink(tmp_path)
 
     if not req_text.strip():
         raise HTTPException(400, "Neizdevās nolasīt prasību dokumentus.")
 
     req_structured = ai_extract_requirements(req_text)
 
-    # -------- CANDIDATES --------
+    # ---------- CANDIDATES ----------
     final_comp = ""
 
     for f in candidates:
         data = await f.read()
         name = f.filename.lower()
-
         cand_text = ""
 
-        if name.endswith(".zip"):
-            extracted = extract_zip_from_bytes(data)
-            for fn, b in extracted.items():
-                cand_text += ai_extract_text_from_binary(fn, b)
-        else:
-            cand_text += ai_extract_text_from_binary(f.filename, data)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        if name.endswith(".pdf"):
+            cand_text += vision_ocr_pdf(tmp_path)
+
+        elif name.endswith(".zip"):
+            for fn, b in extract_zip(tmp_path):
+                with tempfile.NamedTemporaryFile(delete=False) as zf:
+                    zf.write(b)
+                    zp = zf.name
+
+                if fn.lower().endswith(".pdf"):
+                    cand_text += vision_ocr_pdf(zp)
+                elif fn.lower().endswith(".docx"):
+                    cand_text += extract_docx(zp)
+                elif fn.lower().endswith((".txt", ".xml")):
+                    try:
+                        cand_text += clean(b.decode(errors="ignore"))
+                    except Exception:
+                        pass
+
+                os.unlink(zp)
+
+        os.unlink(tmp_path)
 
         comp = ai_compare(req_structured, cand_text)
         final_comp += f"\n\n=== {f.filename} ===\n{comp}"
 
-    # -------- OUTPUT --------
+    # ---------- OUTPUT ----------
     t = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = f"/tmp/report_{t}.html"
 
-    html = build_html(req_structured, final_comp)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(build_html(req_structured, final_comp))
 
     return {"status": "ok", "url": f"/download/{Path(path).name}"}
-
-
-def extract_zip_from_bytes(data: bytes) -> dict:
-    results = {}
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
-    try:
-        results = extract_zip(tmp_path)
-    finally:
-        os.unlink(tmp_path)
-
-    return results
 
 
 @app.get("/download/{filename}")
