@@ -1,77 +1,74 @@
-import os
-from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+import tempfile
+import os
 
-from document_parser import DocumentParserError
-from ai_comparison import AIComparisonEngine
-
-# ==========================
-# FastAPI inicializācija
-# ==========================
 app = FastAPI(
-    title="AI Tender Analyzer API",
-    version="FINAL-ANALYZE-ENDPOINT"
+    title="AI Requirement vs Candidate Analyzer",
+    version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ======================================================
+# CORE ANALYSIS LOGIC (iekšā tajā pašā failā)
+# ======================================================
 
-# ==========================
-# AI Engine
-# ==========================
-ai_engine = AIComparisonEngine()
+def analyze_candidates(requirement_text: str, candidates: List[str]):
+    results = []
 
-# ==========================
-# GALVENAIS ENDPOINTS
-# ==========================
+    for idx, candidate_text in enumerate(candidates, start=1):
+        # ŠEIT vēlāk var pieslēgt OpenAI
+        # Pagaidām – deterministisks skeletons
+
+        if len(candidate_text.strip()) < 50:
+            status = "NOT_COMPLIANT"
+            reason = "Insufficient information provided by candidate."
+            manual_check = True
+        else:
+            status = "PARTIALLY_COMPLIANT"
+            reason = "Some requirements appear to be addressed, but manual verification is required."
+            manual_check = True
+
+        results.append({
+            "candidate_id": idx,
+            "status": status,  # COMPLIANT | PARTIALLY_COMPLIANT | NOT_COMPLIANT
+            "justification": reason,
+            "manual_review_required": manual_check
+        })
+
+    return results
+
+
+# ======================================================
+# API ENDPOINT
+# ======================================================
+
 @app.post("/analyze")
 async def analyze(
-    requirements: UploadFile = File(...),
-    candidate_docs: UploadFile = File(...)
+    requirement: UploadFile = File(...),
+    candidates: List[UploadFile] = File(...)
 ):
-    """
-    IEEJA:
-    - requirements: prasību dokuments (DOCX / PDF)
-    - candidate_docs: kandidāta dokuments vai ZIP
-
-    IZEJA:
-    - ATBILST
-    - MANUĀLI JĀPĀRBAUDA + pamatojumi
-    - NEATBILST + pamatojumi
-    """
-
     try:
-        # --- Saglabājam failus lokāli
-        req_path = Path(f"/tmp/{requirements.filename}")
-        with open(req_path, "wb") as f:
-            f.write(await requirements.read())
+        # Read requirement
+        requirement_bytes = await requirement.read()
+        requirement_text = requirement_bytes.decode("utf-8", errors="ignore")
 
-        cand_path = Path(f"/tmp/{candidate_docs.filename}")
-        with open(cand_path, "wb") as f:
-            f.write(await candidate_docs.read())
+        # Read candidates
+        candidate_texts = []
+        for c in candidates:
+            content = await c.read()
+            candidate_texts.append(content.decode("utf-8", errors="ignore"))
 
-        # --- AI analīze
-        result = ai_engine.analyze(req_path, cand_path)
-
-        # --- TIKAI JSON
-        return JSONResponse(
-            status_code=200,
-            content=result,
-            media_type="application/json"
+        analysis_result = analyze_candidates(
+            requirement_text=requirement_text,
+            candidates=candidate_texts
         )
 
-    except DocumentParserError as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Document parsing error: {str(e)}"}
-        )
+        return JSONResponse({
+            "requirement_file": requirement.filename,
+            "total_candidates": len(candidate_texts),
+            "results": analysis_result
+        })
 
     except Exception as e:
         return JSONResponse(
@@ -79,15 +76,11 @@ async def analyze(
             content={"error": str(e)}
         )
 
-# ==========================
-# HEALTH CHECK
-# ==========================
+
+# ======================================================
+# HEALTHCHECK
+# ======================================================
+
 @app.get("/health")
-async def health():
-    return JSONResponse(
-        content={
-            "status": "ok",
-            "endpoint": "/analyze",
-            "mode": "json-only"
-        }
-    )
+def health():
+    return {"status": "ok"}
